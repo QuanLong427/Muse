@@ -11,6 +11,7 @@ node_modules
 
 # testing
 /coverage
+/backend/.pytest-tmp/
 
 # next.js
 /frontend/.next/
@@ -52,9 +53,10 @@ openspec/
 # ── User data (generated at runtime) ─────────────────────────
 memory/data/
 db/scenario.yml
+/.cache/
 
 # ── LLM-Wiki knowledge base (generated) ─────────────────────
-LLM-Wiki/
+/LLM-Wiki/
 
 # ── Music files ──────────────────────────────────────────────
 Documents/

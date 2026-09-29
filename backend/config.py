@@ -30,9 +30,15 @@ def _resolve_wiki_dir() -> str:
 class Settings:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_BASE_URL: str = os.getenv(
-        "OPENAI_BASE_URL", "https://api.deepseek.com"
+        "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
-    MODEL_NAME: str = os.getenv("MODEL_NAME", "deepseek-chat")
+    MODEL_NAME: str = os.getenv("MODEL_NAME", "qwen3.5-flash")
+    QWEN_AGENT_ENABLE_THINKING: bool = os.getenv(
+        "QWEN_AGENT_ENABLE_THINKING", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    QWEN_AGENT_THINKING_BUDGET: int = int(
+        os.getenv("QWEN_AGENT_THINKING_BUDGET", "2048")
+    )
     MUSIC_DIR: str = _resolve_music_dir()
     WIKI_DIR: str = _resolve_wiki_dir()
     HOST: str = os.getenv("HOST", "0.0.0.0")

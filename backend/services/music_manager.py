@@ -17,10 +17,10 @@ def _is_num(s: str) -> bool:
 
 def parse_name(name: str) -> dict[str, str | None]:
     bvid = ""
-    bvid_match = re.search(r"[_ ]?(BV[A-Za-z0-9]+)$", name)
+    bvid_match = re.search(r"[-_ ]*(BV[A-Za-z0-9]+)$", name)
     if bvid_match:
         bvid = bvid_match.group(1)
-        name = name[: -len(bvid_match.group(0))]
+        name = name[: -len(bvid_match.group(0))].rstrip("-_ ")
 
     parts = name.split("-")
     n = len(parts)
@@ -41,6 +41,18 @@ def parse_name(name: str) -> dict[str, str | None]:
                 "author": "",
                 "date": date,
                 "bvid": bvid or None,
+            }
+
+    # Canonical downloaded-file format: Artist-Title-BVID.  Only apply this
+    # heuristic when a BVID is present so ordinary hyphenated titles stay intact.
+    if bvid and "-" in name:
+        author, title = name.split("-", 1)
+        if author.strip() and title.strip():
+            return {
+                "title": title.strip("-_ "),
+                "author": author.strip(),
+                "date": "",
+                "bvid": bvid,
             }
 
     return {"title": name, "author": "", "date": "", "bvid": bvid or None}

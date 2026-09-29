@@ -3,7 +3,9 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from services.skill_loader import discover_skills, load_skill, select_skill_for_task
+from pathlib import Path
+
+from services.skill_loader import discover_skills, load_skill
 
 
 def test_discover_skills():
@@ -13,6 +15,7 @@ def test_discover_skills():
     assert "local-search" in names
     assert "cloud-search" in names
     assert "convert" in names
+    assert "llm-wiki" in names
 
 
 def test_discover_skills_metadata():
@@ -23,35 +26,6 @@ def test_discover_skills_metadata():
         assert "description" in skill
         assert len(skill["name"]) > 0
         assert len(skill["description"]) > 0
-
-
-def test_select_local_search():
-    """Test local search selected for local keywords."""
-    skills = discover_skills()
-    assert select_skill_for_task("播放晴天", skills) == "local-search"
-    assert select_skill_for_task("本地曲库有什么", skills) == "local-search"
-
-
-def test_select_cloud_search():
-    """Test cloud search selected for cloud keywords."""
-    skills = discover_skills()
-    assert select_skill_for_task("去B站搜周杰伦", skills) == "cloud-search"
-    assert select_skill_for_task("云端搜索晴天", skills) == "cloud-search"
-    assert select_skill_for_task("网上搜一下", skills) == "cloud-search"
-
-
-def test_select_convert():
-    """Test convert selected for conversion keywords."""
-    skills = discover_skills()
-    assert select_skill_for_task("转换这个视频", skills) == "convert"
-    assert select_skill_for_task("下载并转为mp3", skills) == "convert"
-
-
-def test_select_default():
-    """Test default selection is local-search."""
-    skills = discover_skills()
-    assert select_skill_for_task("你好", skills) == "local-search"
-    assert select_skill_for_task("", skills) == "local-search"
 
 
 def test_load_skill_local():
@@ -77,3 +51,19 @@ def test_load_skill_not_found():
     full, body = load_skill("nonexistent")
     assert full == ""
     assert body == ""
+
+
+def test_load_llm_wiki_skill():
+    full, body = load_skill("llm-wiki")
+    assert "name: llm-wiki" in full
+    assert "backend/services/wiki_ingest.py" in body
+
+
+def test_discover_explicit_root_only(tmp_path: Path):
+    skill_dir = tmp_path / "test-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: test-skill\ndescription: Test only\n---\n\n# Test\n",
+        encoding="utf-8",
+    )
+    assert [item["name"] for item in discover_skills(tmp_path)] == ["test-skill"]

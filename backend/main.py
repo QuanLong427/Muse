@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import bili, chat, config, dream, history, playlist, scenario, search, tracks, wiki
+from routers import bili, chat, config, dream, history, memory, playlist, scenario, search, tracks, wiki
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +29,13 @@ async def _dream_scheduler():
         await asyncio.sleep(interval)
         try:
             from services.dream_engine import run_dream
-            result = run_dream()
-            logger.info(f"[dream-scheduler] Auto Dream completed: {result}")
+            from services.memory_store import list_users_with_pending_messages
+
+            for user_id in list_users_with_pending_messages():
+                result = await asyncio.to_thread(run_dream, user_id)
+                logger.info(
+                    f"[dream-scheduler] Auto Dream completed for {user_id}: {result}"
+                )
         except Exception as e:
             logger.error(f"[dream-scheduler] Dream failed: {e}")
 
@@ -44,6 +49,8 @@ async def lifespan(app: FastAPI):
     try:
         from services.system_init import init_system_files
         init_system_files()
+        from services.memory_manager import init_memory_system
+        init_memory_system()
     except Exception as e:
         logger.error(f"[startup] System init failed: {e}")
 
@@ -85,6 +92,7 @@ app.include_router(chat.router)
 app.include_router(config.router)
 app.include_router(dream.router)
 app.include_router(history.router)
+app.include_router(memory.router)
 app.include_router(playlist.router)
 app.include_router(scenario.router)
 app.include_router(search.router)

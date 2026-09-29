@@ -2,10 +2,10 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import settings
-from services.wiki_manager import init_wiki, get_wiki_status
+from services.wiki_manager import audit_wiki_quality, init_wiki, get_wiki_status
 from services.wiki_ingest import ingest_song
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,8 @@ router = APIRouter(prefix="/api/wiki", tags=["wiki"])
 class IngestRequest(BaseModel):
     title: str
     artist: str = ""
+    uploader: str = ""
+    video_title: str = ""
     bvid: str = ""
     local_file_path: str = ""
     album: str = ""
@@ -23,6 +25,7 @@ class IngestRequest(BaseModel):
     description: str = ""
     duration: int = 0
     url: str = ""
+    external_sources: list[dict[str, str]] = Field(default_factory=list)
 
 
 @router.post("/init")
@@ -36,6 +39,12 @@ async def wiki_init():
 async def wiki_status():
     """Get wiki initialization status and statistics."""
     return get_wiki_status()
+
+
+@router.get("/audit")
+async def wiki_audit():
+    """Audit knowledge provenance and graph integrity without modifying data."""
+    return await asyncio.to_thread(audit_wiki_quality, settings.WIKI_DIR)
 
 
 @router.post("/ingest")

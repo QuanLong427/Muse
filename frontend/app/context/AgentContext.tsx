@@ -190,8 +190,11 @@ export function AgentProvider({
   const { mode } = useMode();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
   const streamingIdRef = useRef<string | null>(null);
 
   const [currentScenario, setCurrentScenario] = useState("默认");
@@ -201,21 +204,93 @@ export function AgentProvider({
   const [convertedSet, setConvertedSet] = useState<Set<string>>(new Set());
   const onConvertedTracksRef = useRef<((tracks: Track[]) => void) | null>(null);
 
+  const {
+    state: playerState,
+    addTracks,
+    play,
+    pause,
+    next: playNext,
+    prev: playPrevious,
+    stop,
+    seek,
+    setVolume,
+  } = usePlayer();
+  const playerStateRef = useRef(playerState);
+  useEffect(() => {
+    playerStateRef.current = playerState;
+  }, [playerState]);
+
   // Register auto-add callback from PlayerContext
-  const { addTracks } = usePlayer();
   useEffect(() => {
     onConvertedTracksRef.current = (tracks: Track[]) => {
       addTracks(tracks);
     };
   }, [addTracks]);
 
-  const historyRef = useRef<Array<{ role: string; content: string }>>([]);
+  useEffect(() => {
+    const getOrCreateId = (key: string, legacyDefault?: string) => {
+      const existing = window.localStorage.getItem(key);
+      if (existing) return existing;
+      // Keep the pre-v2 single-user data reachable on first migration. A
+      // future account/new-chat UI can replace these with explicit identities.
+      const value = legacyDefault ?? crypto.randomUUID();
+      window.localStorage.setItem(key, value);
+      return value;
+    };
+    setUserId(getOrCreateId("musicer.user-id", "local"));
+    setSessionId(getOrCreateId("musicer.session-id", "default"));
+  }, []);
+
+  const executePlayerAction = useCallback((data: unknown) => {
+    if (!data || typeof data !== "object") return false;
+    const actionData = data as Record<string, unknown>;
+    if (actionData.type !== "client_action" || actionData.target !== "player") {
+      return false;
+    }
+
+    const value = actionData.value;
+    switch (actionData.action) {
+      case "play":
+        void play();
+        break;
+      case "pause":
+        pause();
+        break;
+      case "next":
+        playNext();
+        break;
+      case "previous":
+        playPrevious();
+        break;
+      case "stop":
+        stop();
+        break;
+      case "seek":
+        if (typeof value === "number" && Number.isFinite(value)) seek(value);
+        break;
+      case "set_volume":
+        if (typeof value === "number" && Number.isFinite(value)) setVolume(value);
+        break;
+      default:
+        return false;
+    }
+    return true;
+  }, [pause, play, playNext, playPrevious, seek, setVolume, stop]);
 
   const { send, loading, cancel: sseCancel } = useSSE({
     url: apiUrl(chatApiPath),
     body: { mode },
     onMessage: (msg) => {
+      if (msg.event === "status" && msg.data && typeof msg.data === "object") {
+        const sid = (msg.data as Record<string, unknown>).session_id;
+        if (typeof sid === "string" && sid) {
+          window.localStorage.setItem("musicer.session-id", sid);
+          setSessionId(sid);
+        }
+        return;
+      }
       if (msg.event === "output") {
+        if (executePlayerAction(msg.data)) return;
         appendFromSdkPayload(msg.data, setMessages, setSessionId, streamingIdRef);
         return;
       }
@@ -233,9 +308,13 @@ export function AgentProvider({
   });
 
   const loadingRef = useRef(loading);
-  loadingRef.current = loading;
   const convertQueueRef = useRef(convertQueue);
-  convertQueueRef.current = convertQueue;
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+  useEffect(() => {
+    convertQueueRef.current = convertQueue;
+  }, [convertQueue]);
 
   const flush = useCallback(() => {
     const queue = convertQueueRef.current;
@@ -255,8 +334,12 @@ export function AgentProvider({
       bvid: t.bvid,
     }));
     const msg = `请将以下B站视频转为音频并加入播放列表:\n${JSON.stringify(items)}`;
-    send(msg);
-  }, [send]);
+    send(msg, {
+      user_id: userId ?? "local",
+      session_id: sessionId ?? "default",
+      scenario: currentScenario,
+    });
+  }, [send, userId, sessionId, currentScenario]);
 
   const queueConvert = useCallback(
     (tracks: ConvertTrack[]) => {
@@ -325,23 +408,26 @@ export function AgentProvider({
 
   // 加载历史会话记录
   useEffect(() => {
+    if (!userId || !sessionId) return;
     const loadHistory = async () => {
       try {
-        const res = await fetch(apiUrl("/api/history"));
+        const params = new URLSearchParams({
+          user_id: userId,
+          session_id: sessionId,
+        });
+        const res = await fetch(apiUrl(`/api/history?${params.toString()}`));
         if (res.ok) {
           const data = await res.json();
-          if (data.history && Array.isArray(data.history) && data.history.length > 0) {
+          if (data.history && Array.isArray(data.history)) {
             const clearOffset = data.clear_offset ?? 0;
             const filtered = data.history.slice(clearOffset);
-            if (filtered.length > 0) {
-              const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => ({
-                id: newId(),
-                role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
-                content: record.content as string,
-                timestamp: new Date(record.timestamp as string).getTime() || Date.now(),
-              }));
-              setMessages(historyMessages);
-            }
+            const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => ({
+              id: newId(),
+              role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
+              content: record.content as string,
+              timestamp: new Date(record.timestamp as string).getTime() || Date.now(),
+            }));
+            setMessages(historyMessages);
           }
         }
       } catch {
@@ -349,7 +435,7 @@ export function AgentProvider({
       }
     };
     loadHistory();
-  }, []);
+  }, [userId, sessionId]);
 
   // 加载场景列表
   useEffect(() => {
@@ -360,9 +446,11 @@ export function AgentProvider({
           const data = await res.json();
           if (data.scenarios && Array.isArray(data.scenarios)) {
             setScenarios(data.scenarios);
-            if (data.scenarios.length > 0 && !data.scenarios.includes(currentScenario)) {
-              setCurrentScenario(data.scenarios[0]);
-            }
+            setCurrentScenario((current) =>
+              data.scenarios.includes(current)
+                ? current
+                : data.scenarios[0] || "默认"
+            );
           }
         }
       } catch {
@@ -417,7 +505,11 @@ export function AgentProvider({
 
       // Handle /clear command
       if (trimmed === "/clear") {
-        await send(trimmed, { history: [], scenario: currentScenario });
+        await send(trimmed, {
+          user_id: userId ?? "local",
+          session_id: sessionId ?? "default",
+          scenario: currentScenario,
+        });
         setMessages([]);
         return;
       }
@@ -433,15 +525,40 @@ export function AgentProvider({
             timestamp: ts,
           },
         ];
-        historyRef.current = next
-          .filter((msg) => msg.role === "agent" || msg.role === "operator")
-          .slice(-30)
-          .map((msg) => ({ role: msg.role, content: msg.content }));
         return next;
       });
-      await send(trimmed, { history: historyRef.current, scenario: currentScenario });
+      const currentPlayerState = playerStateRef.current;
+      await send(trimmed, {
+        user_id: userId ?? "local",
+        session_id: sessionId ?? "default",
+        scenario: currentScenario,
+        player_state: {
+          available: true,
+          current: currentPlayerState.current
+            ? {
+                id: currentPlayerState.current.id,
+                title: currentPlayerState.current.title,
+                author: currentPlayerState.current.author,
+                bvid: currentPlayerState.current.bvid,
+              }
+            : null,
+          playlist: currentPlayerState.playlist.slice(0, 100).map((track) => ({
+            id: track.id,
+            title: track.title,
+            author: track.author,
+            bvid: track.bvid,
+          })),
+          playlist_count: currentPlayerState.playlist.length,
+          playlist_truncated: currentPlayerState.playlist.length > 100,
+          index: currentPlayerState.index,
+          playing: currentPlayerState.playing,
+          progress: currentPlayerState.progress,
+          duration: currentPlayerState.duration,
+          volume: currentPlayerState.volume,
+        },
+      });
     },
-    [send, currentScenario]
+    [send, currentScenario, userId, sessionId]
   );
 
   const clearMessages = useCallback(() => {

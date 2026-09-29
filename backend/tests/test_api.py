@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi.testclient import TestClient
 from main import app
+from config import settings
 
 client = TestClient(app)
 
@@ -53,3 +54,26 @@ def test_chat_missing_message():
     """Test chat endpoint rejects empty message."""
     response = client.post("/api/chat", json={"message": ""})
     assert response.status_code == 400
+
+
+def test_config_update_does_not_persist_masked_api_key(monkeypatch):
+    captured = {}
+
+    def fake_update(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(settings, "update", fake_update)
+    response = client.put(
+        "/api/config",
+        json={
+            "base_url": "https://example.com/compatible-mode/v1/",
+            "api_key": "sk-a****",
+            "model_name": "qwen3.5-flash",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "OPENAI_BASE_URL": "https://example.com/compatible-mode/v1",
+        "MODEL_NAME": "qwen3.5-flash",
+    }

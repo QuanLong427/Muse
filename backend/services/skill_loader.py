@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 SKILL_FILENAME = "SKILL.md"
-DEFAULT_SKILLS_LIBRARY = Path(__file__).resolve().parent.parent.parent / "skills"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_SKILLS_LIBRARY = PROJECT_ROOT / "skills"
 
 # YAML frontmatter pattern: --- ... ---
 FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -31,6 +32,12 @@ def _parse_frontmatter(raw: str) -> Dict[str, str]:
     return meta
 
 
+def _skill_roots(skills_root: Optional[Path] = None) -> List[Path]:
+    if skills_root is not None:
+        return [Path(skills_root)]
+    return [DEFAULT_SKILLS_LIBRARY]
+
+
 def discover_skills(skills_root: Optional[Path] = None) -> List[Dict[str, str]]:
     """
     发现技能：扫描技能库目录，读取每个子目录中的 SKILL.md 的 frontmatter（name、description）。
@@ -42,25 +49,27 @@ def discover_skills(skills_root: Optional[Path] = None) -> List[Dict[str, str]]:
     Returns:
         列表，每项为 {"name": str, "description": str, ...}，按 name 排序。
     """
-    root = Path(skills_root) if skills_root else DEFAULT_SKILLS_LIBRARY
-    if not root.is_dir():
-        return []
-
     result: List[Dict[str, str]] = []
-    for path in sorted(root.iterdir()):
-        if not path.is_dir():
+    seen_names = set()
+    for root in _skill_roots(skills_root):
+        if not root.is_dir():
             continue
-        skill_md = path / SKILL_FILENAME
-        if not skill_md.is_file():
-            continue
-        try:
-            raw = skill_md.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        meta = _parse_frontmatter(raw)
-        if meta.get("name"):
-            result.append(meta)
-    return result
+        for path in sorted(root.iterdir()):
+            if not path.is_dir():
+                continue
+            skill_md = path / SKILL_FILENAME
+            if not skill_md.is_file():
+                continue
+            try:
+                raw = skill_md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            meta = _parse_frontmatter(raw)
+            name = meta.get("name")
+            if name and name not in seen_names:
+                result.append(meta)
+                seen_names.add(name)
+    return sorted(result, key=lambda item: item["name"])
 
 
 def load_skill(skill_name: str, skills_root: Optional[Path] = None) -> Tuple[str, str]:
@@ -75,15 +84,24 @@ def load_skill(skill_name: str, skills_root: Optional[Path] = None) -> Tuple[str
     Returns:
         (full_content, body_only)。full_content 为完整文件内容；body_only 为去掉 frontmatter 的正文。
     """
-    root = Path(skills_root) if skills_root else DEFAULT_SKILLS_LIBRARY
-    skill_dir = root / skill_name
-    skill_md = skill_dir / SKILL_FILENAME
-    if not skill_md.is_file():
-        return "", ""
-
-    try:
-        full = skill_md.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    full = ""
+    for root in _skill_roots(skills_root):
+        if not root.is_dir():
+            continue
+        for skill_dir in root.iterdir():
+            skill_md = skill_dir / SKILL_FILENAME
+            if not skill_dir.is_dir() or not skill_md.is_file():
+                continue
+            try:
+                candidate = skill_md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _parse_frontmatter(candidate).get("name") == skill_name:
+                full = candidate
+                break
+        if full:
+            break
+    if not full:
         return "", ""
 
     # 去掉 frontmatter 得到正文（供 LLM 使用）

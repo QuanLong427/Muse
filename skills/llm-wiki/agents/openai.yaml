@@ -1,0 +1,6 @@
+interface:
+  display_name: "LLM-Wiki"
+  short_description: "基于证据构建、查询并审计 Musicer 音乐知识库"
+  default_prompt: "Use $llm-wiki to audit the Musicer knowledge base and recommend the next safe action."
+policy:
+  allow_implicit_invocation: true

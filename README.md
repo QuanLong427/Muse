@@ -15,10 +15,11 @@ AI Agent 驱动的 B站音频播放器。随时随地，想听就听，不止于
 ## Features
 
 - **LangGraph ReAct Agent** — LLM 自主决策工具调用，多轮迭代推理，SSE 流式输出
+- **Agent 播放器控制** — 对话中读取当前播放状态，并控制播放、暂停、上一首、下一首、停止、进度与音量
 - **前端 LLM 配置** — 齿轮按钮打开设置弹窗，随时切换 API Key / Base URL / Model，无需重启
 - **双模式切换** — 本地曲库搜索 / B站云端搜索
 - **云端本地优先** — 云端 ADD 自动检测本地已有文件，避免重复转换
-- **B站全链路** — 视频搜索（WBI 签名）→ 转 MP3 下载 → 弹幕叠加播放 → 自动入库知识库
+- **B站全链路** — 视频搜索（WBI 签名）→ 转 MP3 下载 → 弹幕叠加播放；知识库写入保持显式授权
 - **弹幕播放** — 播放 B站歌曲时实时叠加弹幕，同步播放进度
 - **分层记忆系统** — 短期（对话）/ 中期（JSONL 历史）/ 长期（用户画像），Dream 引擎自动沉淀
 - **LLM-Wiki 知识库** — 基于 Karpathy llm-wiki 方法论，自动消化入库歌曲为结构化知识库，并构建一个知识图谱
@@ -26,6 +27,7 @@ AI Agent 驱动的 B站音频播放器。随时随地，想听就听，不止于
   ![image-20260609193141187](./assets/image-20260609193141187.png)
 - **场景感知推荐** — 自定义场景（编程/跑步/睡觉等），每个场景独立维护偏好
 - **知识库检索子 Agent** — 独立 LangGraph 子图，用户画像上下文感知进行个性化推荐
+- **可追溯联网取证** — Qwen 网页搜索发现翻唱/Live/Remix 等长尾版本，网页抓取与哈希缓存保证 Wiki 引用可核对
 - **画像增强搜索** — 推荐类查询自动注入用户画像中的流派/歌手到搜索关键词
 - **斜杠命令** — 聊天中输入 `/reset-wiki`、`/reset-memory`、`/clear` 等管理命令
 
@@ -41,7 +43,7 @@ AI Agent 驱动的 B站音频播放器。随时随地，想听就听，不止于
 | 记忆     | JSONL 历史 + Markdown 用户画像 + Dream 引擎       |
 | 知识库   | LLM-Wiki（本地 Markdown wiki + grep 检索）        |
 | 数据库   | SQLite（播放列表持久化）                          |
-| 外部工具 | bv2mp3 + ffmpeg（视频转音频）                     |
+| 外部工具 | Qwen 联网搜索 + 网页取证 + bv2mp3 + ffmpeg       |
 
 ## Architecture
 
@@ -81,7 +83,7 @@ AI Agent 驱动的 B站音频播放器。随时随地，想听就听，不止于
 │                     ┌──────────────┐            ┌──────────────────────┐        │
 │                     │convert_video │            │   Wiki Sub-Agent     │        │
 │                     │视频→MP3 转换  │            │   (LangGraph 子图)   │        │
-│                     │  + 入库       │            │                      │        │
+│                     │（不隐式入库）  │            │                      │        │
 │                     └──────┬───────┘            │  ┌────────┐          │        │
 │                            │                    │  │AgentNode│──┐      │        │
 │                            ▼                    │  └────────┘  │      │        │
@@ -178,18 +180,28 @@ BACKEND_URL=http://localhost:8000
 MUSIC_DIR=Documents/bili
 
 # backend/.env — 后端配置（Python FastAPI）
-OPENAI_BASE_URL=https://api.deepseek.com
-MODEL_NAME=deepseek-chat
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL_NAME=qwen3.5-flash
 MUSIC_DIR=Documents/bili
 BACKEND_PORT=8000
 
 # backend/.env.local — 后端私密配置（git 自动忽略）
-OPENAI_API_KEY=your-api-key-here
+OPENAI_BASE_URL=https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+OPENAI_API_KEY=your-dashscope-api-key-here
+MODEL_NAME=qwen3.5-flash
 ```
 
 > 前后端的 `MUSIC_DIR` 需保持一致，指向同一个音乐目录。
+> 推荐使用百炼控制台提供的业务空间专属 Base URL；API Key 必须与该业务空间和地域匹配。Base URL 不要包含 `/chat/completions`。
 
 也可以启动后通过前端齿轮按钮（⚙）在线配置 LLM 参数，配置会自动写入 `backend/.env.local`。
+
+Qwen3.5-Flash 的请求按任务自动优化：LLM-Wiki 结构化抽取使用 JSON 模式并关闭思考；主 Agent/Skill 工具选择启用有限思考；Dream 和普通检索关闭思考。可以在 `backend/.env.local` 调整 Agent 思考预算：
+
+```env
+QWEN_AGENT_ENABLE_THINKING=true
+QWEN_AGENT_THINKING_BUDGET=2048
+```
 
 #### 3. 安装依赖
 
@@ -302,6 +314,7 @@ Musicer/
 │   ├── cloud-search/           # B站云端搜索
 │   ├── convert/                # 视频转音频
 │   ├── local-search/           # 本地曲库搜索
+│   ├── llm-wiki/               # 知识库构建、查询和审计
 │   └── slash-commands/         # 斜杠命令
 │
 ├── memory/                     # 记忆系统
@@ -332,6 +345,7 @@ Musicer/
 | POST            | `/api/dream`                      | 手动触发 Dream 引擎                  |
 | GET             | `/api/history`                    | 获取对话历史                         |
 | GET/POST        | `/api/wiki/status`                | LLM-Wiki 状态/初始化                 |
+| GET             | `/api/wiki/audit`                 | LLM-Wiki 证据与图谱质量审计          |
 
 ## Usage
 
@@ -347,12 +361,27 @@ Musicer/
 
 配置保存后立即生效，无需重启后端。
 
+### Agent Skill
+
+Musicer 的 LangGraph Agent 会从 `skills/` 发现 Skill，并根据用户意图渐进加载完整说明。例如询问知识库质量时，Agent 会选择 `llm-wiki`：
+
+```text
+审计当前知识库，并告诉我哪些内容不能作为可靠事实
+```
+
+Skill 只负责编排 Ingest、Query、Lint 与按需联网取证；`web_search` 发现候选页面，`web_fetch` 抓取并缓存可核对正文，证据校验和知识库写入仍由后端确定性代码执行。只读检查也可以直接运行：
+
+```powershell
+backend/.venv/Scripts/python.exe skills/llm-wiki/scripts/wiki_ops.py status
+backend/.venv/Scripts/python.exe skills/llm-wiki/scripts/wiki_ops.py audit
+```
+
 ### AI 对话示例
 
 - "推荐几首歌给我" — AI 结合用户画像和知识库推荐
 - "播放晴天" — 直接搜索本地/云端并播放
 - "我平时喜欢听什么" — 从长期记忆中查询偏好
-- "云端搜一首摇滚" — B站搜索 + 自动入库到 LLM-Wiki
+- "云端搜一首摇滚" — B站搜索；只有明确要求时才写入 LLM-Wiki
 
 ### 斜杠命令
 

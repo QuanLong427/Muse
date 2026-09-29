@@ -12,6 +12,11 @@ def _mask_key(key: str) -> str:
     return key[:4] + "****"
 
 
+def _is_masked_key(key: str) -> bool:
+    """Prevent the settings form from persisting its masked placeholder."""
+    return key.endswith("****")
+
+
 @router.get("/api/config")
 async def get_config():
     return {
@@ -31,11 +36,11 @@ class ConfigUpdate(BaseModel):
 async def update_config(body: ConfigUpdate):
     updates: dict[str, str] = {}
     if body.base_url is not None:
-        updates["OPENAI_BASE_URL"] = body.base_url
-    if body.api_key is not None:
-        updates["OPENAI_API_KEY"] = body.api_key
+        updates["OPENAI_BASE_URL"] = body.base_url.strip().rstrip("/")
+    if body.api_key is not None and not _is_masked_key(body.api_key):
+        updates["OPENAI_API_KEY"] = body.api_key.strip()
     if body.model_name is not None:
-        updates["MODEL_NAME"] = body.model_name
+        updates["MODEL_NAME"] = body.model_name.strip()
 
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")

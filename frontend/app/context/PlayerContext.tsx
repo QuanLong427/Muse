@@ -19,6 +19,8 @@ type PlayerCtx = {
   playTrack: (track: Track, playlist?: Track[]) => void;
   addTracks: (tracks: Track[]) => void;
   removeTrack: (trackId: string) => void;
+  play: () => void | Promise<void>;
+  pause: () => void;
   next: () => void;
   prev: () => void;
   togglePlay: () => void | Promise<void>;
@@ -77,13 +79,6 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     indexRef.current = index;
   }, [index]);
 
-  useEffect(() => {
-    if (shouldPauseRef.current) {
-      shouldPauseRef.current = false;
-      pause();
-    }
-  });
-
   const handleEnded = useCallback(() => {
     const pl = playlistRef.current;
     if (!pl.length) return;
@@ -103,9 +98,17 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     toggle,
     seek,
     setVolume,
+    play,
     playTrack,
     pause,
   } = useAudioPlayer({ onEnded: handleEnded });
+
+  useEffect(() => {
+    if (shouldPauseRef.current) {
+      shouldPauseRef.current = false;
+      pause();
+    }
+  }, [pause]);
 
   useEffect(() => {
     playTrackInternalRef.current = playTrack;
@@ -183,7 +186,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       setIndex(newIndex);
       if (shouldPlayNext && nextTrack) playTrack(nextTrack);
     },
-    [playTrack, playing, syncToBackend]
+    [audioRef, playTrack, playing, syncToBackend]
   );
 
   const playTrackWrapped = useCallback(
@@ -259,6 +262,21 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     seek(0);
   }, [pause, seek]);
 
+  const playWrapped = useCallback(() => {
+    const pl = playlistRef.current;
+    if (!pl.length) return;
+    if (indexRef.current < 0 || !pl[indexRef.current]) {
+      const first = pl[0];
+      if (first) {
+        setIndex(0);
+        indexRef.current = 0;
+        playTrack(first);
+      }
+      return;
+    }
+    return play();
+  }, [play, playTrack]);
+
   const clearTrackRemoved = useCallback(() => {
     setTrackRemoved(false);
   }, []);
@@ -282,6 +300,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       playTrack: playTrackWrapped,
       addTracks,
       removeTrack,
+      play: playWrapped,
+      pause,
       next,
       prev,
       togglePlay: togglePlayWrapped,
@@ -292,7 +312,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       trackRemoved,
       clearTrackRemoved,
     }),
-    [state, playTrackWrapped, addTracks, removeTrack, next, prev, togglePlayWrapped, seek, setVolume, stop, audioRef, trackRemoved, clearTrackRemoved]
+    [state, playTrackWrapped, addTracks, removeTrack, playWrapped, pause, next, prev, togglePlayWrapped, seek, setVolume, stop, audioRef, trackRemoved, clearTrackRemoved]
   );
 
   return (

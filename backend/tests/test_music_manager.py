@@ -66,3 +66,22 @@ def test_parse_name_year_out_of_range():
     assert result["title"] == "song-1980-01-15"
     assert result["author"] == ""
     assert result["date"] == ""
+
+
+def test_parse_name_canonical_downloaded_file():
+    """Canonical Artist-Title-BVID files expose artist and title separately."""
+    result = parse_name("周杰伦-晴天-BV1xx411c7mD")
+    assert result == {
+        "title": "晴天",
+        "author": "周杰伦",
+        "date": "",
+        "bvid": "BV1xx411c7mD",
+    }
+
+
+def test_parse_name_legacy_double_dash_before_bvid():
+    """Files created by the old rename bug remain readable."""
+    result = parse_name("周杰伦-晴天--BV1xx411c7mD")
+    assert result["title"] == "晴天"
+    assert result["author"] == "周杰伦"
+    assert result["bvid"] == "BV1xx411c7mD"

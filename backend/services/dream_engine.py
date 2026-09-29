@@ -1,190 +1,263 @@
-"""
-Dream Engine - 从对话历史中总结用户画像
+"""Evidence-based background consolidation for Musicer memory v2."""
 
-定期调用 LLM，将 history.jsonl 中的新记录总结到 user_profile.md
-按场景分组分析偏好
-"""
+from __future__ import annotations
 
 import json
 import logging
-from collections import defaultdict
-from datetime import datetime
-from typing import Any, Dict, List
-
-from openai import OpenAI
+import re
+import threading
+from typing import Any
 
 from config import settings
+from services.llm_client import completion_options, create_openai_client
 from services.memory_manager import (
-    get_dream_offset,
-    read_history_from_offset,
-    read_profile,
-    update_dream_offset,
-    write_profile,
+    init_memory_system,
+    render_structured_memories,
+    sync_profile_projection,
+)
+from services.memory_store import (
+    DEFAULT_USER_ID,
+    create_dream_run,
+    finish_dream_run,
+    get_pending_messages,
+    mark_messages_processed,
+    stage_candidate,
 )
 from services.scenario_manager import read_scenarios
 
-logger = logging.getLogger(__name__)
 
-# Dream 系统提示词
-DREAM_SYSTEM_PROMPT = """你是一个音乐偏好分析引擎。你的任务是根据用户的对话历史，更新用户的音乐画像。
+logger = logging.getLogger(__name__)
+_dream_lock = threading.Lock()
+
+
+DREAM_SYSTEM_PROMPT = """你是 Musicer 的记忆候选提取器，不是用户画像的自由写作者。
+
+你只能从标记为 user 的原始消息提取候选，禁止把 Agent 回答、网络内容或猜测当成用户偏好。
+输出一个 JSON 对象，不要输出 Markdown：
+{
+  "candidates": [
+    {
+      "kind": "preference|avoidance|interaction|language|music_fact",
+      "scenario": "全局或给定场景",
+      "memory_key": "稳定、简短、可用于覆盖旧值的键",
+      "directive": "可直接指导未来行为的中文指令",
+      "confidence": 0.0,
+      "evidence_type": "explicit_preference|explicit_correction|repeated_behavior|temporary_request|agent_inference|external_content",
+      "source_message_ids": [123]
+    }
+  ]
+}
 
 规则：
-1. 只更新有新数据的部分，不要重复已有的偏好
-2. 保留原有的偏好，只添加新的发现
-3. 按场景分组分析偏好（每个场景独立维护：音乐类型偏好占比、核心歌手/乐队、近期听歌轨迹）
-4. 更新"近期听歌轨迹"表格（FIFO，保留最近20首）
-5. 如果发现新的核心歌手/乐队，添加到对应场景
-6. 如果发现新的音乐类型偏好，更新占比
-7. 不同场景的偏好互不影响，各自独立
+1. “我喜欢/不要/以后都/记住/纠正一下”等明确表达可标 explicit_preference 或 explicit_correction。
+2. “今天/这次/现在想听”属于 temporary_request，不得伪装成长期偏好。
+3. 只出现一次的播放或搜索请求通常不是长期偏好。
+4. source_message_ids 必须逐字使用输入中的消息 ID，不得编造。
+5. 没有可靠候选时返回 {"candidates": []}。
+6. 不要复述当前长期记忆中已经完全相同的指令。"""
 
-输出格式：直接输出更新后的完整 user_profile.md 内容，保持原有格式。"""
+_ALLOWED_KINDS = {"preference", "avoidance", "interaction", "language", "music_fact"}
+_ALLOWED_EVIDENCE = {
+    "explicit_preference",
+    "explicit_correction",
+    "repeated_behavior",
+    "temporary_request",
+    "agent_inference",
+    "external_content",
+}
 
 
-def _group_by_scenario(records: List[Dict[str, Any]]) -> dict[str, List[Dict[str, Any]]]:
-    """按场景分组对话记录"""
-    grouped: dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in records:
-        scenario = r.get("scenario", "默认") or "默认"
-        grouped[scenario].append(r)
-    return dict(grouped)
+def _extract_json(text: str) -> dict[str, Any]:
+    stripped = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped, re.IGNORECASE)
+    if fenced:
+        stripped = fenced.group(1).strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("Dream did not return a JSON object")
+        value = json.loads(stripped[start : end + 1])
+    if not isinstance(value, dict) or not isinstance(value.get("candidates"), list):
+        raise ValueError("Dream JSON must contain a candidates array")
+    return value
 
 
 def _build_dream_prompt(
-    new_records: List[Dict[str, Any]],
-    current_profile: str,
-    scenarios: List[str],
+    user_messages: list[dict[str, Any]],
+    current_memory: str,
+    scenarios: list[str],
 ) -> str:
-    """构建 Dream 提示词，按场景分组展示"""
-    grouped = _group_by_scenario(new_records)
-
-    sections = []
-    for scenario, records in sorted(grouped.items()):
-        records_text = "\n".join(
-            f"  [{r.get('timestamp', '')}] {r.get('role', '')}: {r.get('content', '')}"
-            for r in records
-        )
-        sections.append(f"【场景: {scenario}】({len(records)} 条)\n{records_text}")
-
-    records_text = "\n\n".join(sections)
-    scenarios_text = ", ".join(scenarios)
-
-    return f"""以下是用户的新对话历史（已按场景分组）：
-
-{records_text}
-
-当前用户画像：
-{current_profile}
-
-当前所有场景列表：{scenarios_text}
-
-请根据新的对话历史，更新用户画像。注意：
-1. 保留原有偏好，只添加新发现
-2. 按场景分组更新——不同场景的偏好独立维护
-3. 确保用户画像中包含以上所有场景的 section，如果某个场景在画像中没有对应 section，请创建一个空的模板 section
-4. 每个场景内更新：音乐类型偏好占比、核心歌手/乐队、近期听歌轨迹
-5. 更新近期听歌轨迹（如果对话中提到了具体的歌曲）
-6. 不要混淆不同场景的偏好"""
-
-
-def _validate_dream_output(profile_text: str) -> bool:
-    """Validate that LLM output contains required sections."""
-    required = ["## 全局基准", "## 场景:"]
-    for section in required:
-        if section not in profile_text:
-            logger.warning(f"[dream] Missing required section in output: {section}")
-            return False
-    return True
-
-
-def run_dream() -> dict[str, Any]:
-    """
-    执行 Dream：从 history.jsonl 总结用户画像到 user_profile.md
-
-    Returns:
+    evidence = [
         {
-            "status": "success" | "no_new_data" | "error",
-            "processed_count": int,
-            "message": str,
+            "id": item["id"],
+            "created_at": item["timestamp"],
+            "scenario": item.get("scenario") or "默认",
+            "role": "user",
+            "content": item["content"],
         }
-    """
-    # 1. 读取新记录
-    new_records = read_history_from_offset()
-    if not new_records:
-        return {
-            "status": "no_new_data",
-            "processed_count": 0,
-            "message": "没有新的对话记录需要处理",
-        }
+        for item in user_messages
+    ]
+    return (
+        "可用场景："
+        + json.dumps(["全局", *scenarios], ensure_ascii=False)
+        + "\n当前已生效的结构化记忆：\n"
+        + (current_memory or "（无）")
+        + "\n\n本批唯一可信证据（JSON）：\n"
+        + json.dumps(evidence, ensure_ascii=False, indent=2)
+    )
 
-    # 2. 读取当前画像
-    current_profile = read_profile()
 
-    # 3. 读取场景列表
-    scenarios = read_scenarios()
-
-    # 4. 按场景分组统计
-    grouped = _group_by_scenario(new_records)
-    scenario_summary = ", ".join(f"{s}({len(r)}条)" for s, r in sorted(grouped.items()))
-
-    # 5. 调用 LLM 总结
+def _validate_candidate(
+    raw: Any,
+    *,
+    allowed_source_ids: set[int],
+    scenarios: set[str],
+) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("kind", "")).strip()
+    evidence_type = str(raw.get("evidence_type", "")).strip()
+    scenario = str(raw.get("scenario", "默认")).strip() or "默认"
+    memory_key = str(raw.get("memory_key", "")).strip()
+    directive = str(raw.get("directive", "")).strip()
     try:
-        client = OpenAI(
-            api_key=settings.OPENAI_API_KEY,
-            base_url=settings.OPENAI_BASE_URL,
-        )
+        confidence = float(raw.get("confidence", 0))
+    except (TypeError, ValueError):
+        return None
+    try:
+        sources = sorted({int(value) for value in raw.get("source_message_ids", [])})
+    except (TypeError, ValueError):
+        return None
+    if kind not in _ALLOWED_KINDS or evidence_type not in _ALLOWED_EVIDENCE:
+        return None
+    if scenario not in scenarios or not memory_key or not directive:
+        return None
+    if not sources or any(source not in allowed_source_ids for source in sources):
+        return None
+    return {
+        "kind": kind,
+        "scenario": scenario,
+        "memory_key": memory_key[:160],
+        "directive": directive[:1000],
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "evidence_type": evidence_type,
+        "source_message_ids": sources,
+    }
 
+
+def run_dream(user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+    """Extract, gate and promote structured memories from pending messages."""
+    if not _dream_lock.acquire(blocking=False):
+        return {
+            "status": "busy",
+            "processed_count": 0,
+            "message": "Dream 已在运行，本次请求已跳过",
+        }
+    run_id: str | None = None
+    try:
+        init_memory_system()
+        pending = get_pending_messages(user_id, limit=100)
+        if not pending:
+            return {
+                "status": "no_new_data",
+                "processed_count": 0,
+                "message": "没有新的对话记录需要处理",
+            }
+
+        run_id = create_dream_run(user_id)
+        user_messages = [item for item in pending if item["role"] == "user"]
+        pending_ids = [int(item["id"]) for item in pending]
+        if not user_messages:
+            mark_messages_processed(pending_ids)
+            finish_dream_run(
+                run_id,
+                status="success",
+                processed_count=len(pending),
+                detail={"reason": "no_user_evidence"},
+            )
+            return {
+                "status": "success",
+                "processed_count": len(pending),
+                "promoted_count": 0,
+                "message": "已处理记录，但没有可用于记忆的用户证据",
+            }
+
+        scenarios = read_scenarios()
+        current_memory = render_structured_memories(user_id)
+        client = create_openai_client()
         response = client.chat.completions.create(
             model=settings.MODEL_NAME,
             messages=[
                 {"role": "system", "content": DREAM_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_dream_prompt(new_records, current_profile, scenarios)},
+                {
+                    "role": "user",
+                    "content": _build_dream_prompt(user_messages, current_memory, scenarios),
+                },
             ],
-            temperature=0.3,
-            max_tokens=4096,
+            temperature=0.1,
+            max_completion_tokens=2048,
+            **completion_options("plain"),
         )
+        parsed = _extract_json(response.choices[0].message.content or "")
+        allowed_source_ids = {int(item["id"]) for item in user_messages}
+        allowed_scenarios = {"全局", *scenarios}
 
-        updated_profile = response.choices[0].message.content
+        results = []
+        for raw in parsed["candidates"][:30]:
+            candidate = _validate_candidate(
+                raw,
+                allowed_source_ids=allowed_source_ids,
+                scenarios=allowed_scenarios,
+            )
+            if not candidate:
+                results.append({"status": "rejected", "reason": "候选结构或来源无效"})
+                continue
+            results.append(stage_candidate(user_id=user_id, **candidate))
 
-        # 5. Validate output
-        if not _validate_dream_output(updated_profile):
-            logger.warning("[dream] LLM output failed validation, skipping profile write")
-            return {
-                "status": "error",
-                "processed_count": 0,
-                "message": "LLM output missing required sections (## 全局基准, ## 场景:)",
-            }
-
-        # 6. 写入更新后的画像
-        # 添加更新时间戳
-        timestamp_line = f"> **Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (由 Dream 引擎自动更新)\n"
-        if "> **Last Updated:**" in updated_profile:
-            # 替换已有的时间戳
-            lines = updated_profile.split("\n")
-            for i, line in enumerate(lines):
-                if line.startswith("> **Last Updated:**"):
-                    lines[i] = timestamp_line.strip()
-                    break
-            updated_profile = "\n".join(lines)
-        else:
-            # 在文件开头添加时间戳
-            updated_profile = timestamp_line + updated_profile
-
-        write_profile(updated_profile)
-
-        # 7. 更新 dream_offset
-        current_offset = get_dream_offset()
-        new_offset = current_offset + len(new_records)
-        update_dream_offset(new_offset)
-
+        counts = {
+            name: sum(1 for item in results if item["status"] == name)
+            for name in ("promoted", "pending", "rejected")
+        }
+        # Mark the batch only after parsing and staging completed successfully.
+        mark_messages_processed(pending_ids)
+        if counts["promoted"]:
+            sync_profile_projection(user_id)
+        finish_dream_run(
+            run_id,
+            status="success",
+            processed_count=len(pending),
+            promoted_count=counts["promoted"],
+            pending_count=counts["pending"],
+            rejected_count=counts["rejected"],
+            detail={"candidate_count": len(results)},
+        )
         return {
             "status": "success",
-            "processed_count": len(new_records),
-            "message": f"成功处理 {len(new_records)} 条对话记录（{scenario_summary}），用户画像已更新",
+            "processed_count": len(pending),
+            "promoted_count": counts["promoted"],
+            "pending_count": counts["pending"],
+            "rejected_count": counts["rejected"],
+            "message": (
+                f"处理 {len(pending)} 条记录：晋升 {counts['promoted']}，"
+                f"待观察 {counts['pending']}，拒绝 {counts['rejected']}"
+            ),
         }
-
-    except Exception as e:
+    except Exception as exc:
+        logger.exception("[dream] consolidation failed")
+        if run_id:
+            finish_dream_run(
+                run_id,
+                status="error",
+                processed_count=0,
+                detail={"error": str(exc)},
+            )
         return {
             "status": "error",
             "processed_count": 0,
-            "message": f"Dream 失败: {str(e)}",
+            "message": f"Dream 失败: {exc}",
         }
+    finally:
+        _dream_lock.release()

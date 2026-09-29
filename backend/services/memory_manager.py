@@ -1,104 +1,202 @@
-"""
-Memory Manager - 分层记忆管理模块
+"""Compatibility facade for the v2 memory system.
 
-中期记忆: history.jsonl (JSONL格式，首行metadata存储dream_offset)
-长期记忆: user_profile.md (结构化用户画像)
+SQLite is the source of truth for conversations and structured memories. The
+Markdown profile remains an inspectable compatibility projection so existing
+prompt and UI code can transition without losing the user's current profile.
 """
+
+from __future__ import annotations
 
 import json
-import os
+import re
+import hashlib
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from config import PROJECT_ROOT
+from services.memory_store import (
+    DEFAULT_SESSION_ID,
+    DEFAULT_USER_ID,
+    add_message,
+    count_pending_messages,
+    ensure_session,
+    get_meta,
+    get_pending_messages,
+    get_session_history,
+    init_memory_db,
+    list_memory_items,
+    mark_messages_processed,
+    reset_user_memory,
+    set_meta,
+)
 
-# 路径常量
+
 MEMORY_DIR = PROJECT_ROOT / "memory"
 TEMPLATE_DIR = PROJECT_ROOT / "template" / "memory"
 DATA_DIR = MEMORY_DIR / "data"
-HISTORY_FILE = DATA_DIR / "history.jsonl"
+HISTORY_FILE = DATA_DIR / "history.jsonl"  # legacy import only
 PROFILE_FILE = DATA_DIR / "user_profile.md"
 TEMPLATE_PROFILE = TEMPLATE_DIR / "user_profile.md"
 
-MAX_HISTORY_ENTRIES = 50  # FIFO 容量
+STRUCTURED_SECTION = "## 结构化长期记忆"
 
 
-def _ensure_dirs():
-    """确保目录存在"""
+def _ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _ensure_history_file():
-    """确保 history.jsonl 存在，不存在则初始化"""
+def _profile_path(user_id: str = DEFAULT_USER_ID):
+    if user_id == DEFAULT_USER_ID:
+        return PROFILE_FILE
+    user_hash = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
+    return DATA_DIR / "users" / user_hash / "user_profile.md"
+
+
+def _base_profile(user_id: str = DEFAULT_USER_ID) -> str:
     _ensure_dirs()
-    if not HISTORY_FILE.exists():
-        metadata = {
-            "type": "metadata",
-            "dream_offset": 0,
-            "clear_offset": 0,
-            "created_at": datetime.now().isoformat(),
-        }
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            f.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+    profile_path = _profile_path(user_id)
+    if profile_path.exists():
+        return profile_path.read_text(encoding="utf-8")
+    if TEMPLATE_PROFILE.exists():
+        content = TEMPLATE_PROFILE.read_text(encoding="utf-8")
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(content, encoding="utf-8")
+        return content
+    return ""
 
 
-def _read_all_lines() -> List[Dict[str, Any]]:
-    """读取 history.jsonl 所有行"""
-    _ensure_history_file()
-    lines = []
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                lines.append(json.loads(line))
-    return lines
-
-
-def _write_all_lines(lines: List[Dict[str, Any]]):
-    """写入所有行到 history.jsonl"""
-    _ensure_dirs()
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        for item in lines:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-
-# ── 长期记忆 (Profile) ──────────────────────────────────────────────────────
-
-
-def read_profile() -> str:
-    """读取长期记忆 user_profile.md"""
-    _ensure_dirs()
-    if not PROFILE_FILE.exists():
-        # 从模板复制
-        if TEMPLATE_PROFILE.exists():
-            return TEMPLATE_PROFILE.read_text(encoding="utf-8")
+def _without_structured_projection(content: str) -> str:
+    marker = f"\n{STRUCTURED_SECTION}"
+    index = content.find(marker)
+    if index >= 0:
+        return content[:index].rstrip() + "\n"
+    if content.startswith(STRUCTURED_SECTION):
         return ""
-    return PROFILE_FILE.read_text(encoding="utf-8")
+    return content.rstrip() + "\n"
 
 
-def write_profile(content: str):
-    """写入长期记忆 user_profile.md"""
+def render_structured_memories(user_id: str = DEFAULT_USER_ID) -> str:
+    items = list_memory_items(user_id, limit=500)
+    if not items:
+        return ""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(item["scenario"], []).append(item)
+    lines = [STRUCTURED_SECTION, "", "> 由结构化记忆数据库生成；每条记录均保留来源消息与置信度。"]
+    for scenario in sorted(grouped, key=lambda value: (value != "全局", value)):
+        lines.extend(["", f"### {scenario}", ""])
+        for item in grouped[scenario]:
+            lines.append(
+                f"- {item['directive']} "
+                f"`{item['memory_key']}` "
+                f"(置信度 {float(item['confidence']):.2f}，证据 {item['evidence_count']} 条)"
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def sync_profile_projection(user_id: str = DEFAULT_USER_ID) -> None:
+    """Refresh only the generated section; preserve the existing profile."""
+    base = _without_structured_projection(_base_profile(user_id))
+    projection = render_structured_memories(user_id)
+    content = base.rstrip()
+    if projection:
+        content += "\n\n" + projection.rstrip()
+    profile_path = _profile_path(user_id)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def read_profile(user_id: str = DEFAULT_USER_ID) -> str:
+    init_memory_system()
+    return _base_profile(user_id)
+
+
+def write_profile(content: str, user_id: str = DEFAULT_USER_ID) -> None:
+    """Write the inspectable profile document (legacy compatibility)."""
     _ensure_dirs()
-    PROFILE_FILE.write_text(content, encoding="utf-8")
+    profile_path = _profile_path(user_id)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(content, encoding="utf-8")
 
 
-def remove_profile_scenario(scenario_name: str):
-    """从 user_profile.md 中删除指定场景的 section"""
-    import re
-    content = read_profile()
-    # Match from "## 场景:<name>" to the next "## " or end of file
-    pattern = rf'\n## 场景:{re.escape(scenario_name)}\b.*?(?=\n## |\Z)'
-    new_content = re.sub(pattern, '', content, flags=re.DOTALL)
-    write_profile(new_content)
+def get_structured_memory_context(
+    user_id: str = DEFAULT_USER_ID,
+    scenario: str = "默认",
+    limit: int = 20,
+) -> str:
+    """Return bounded active directives for prompt injection."""
+    items = list_memory_items(
+        user_id,
+        scenario=scenario or "默认",
+        include_global=True,
+        limit=limit,
+    )
+    if not items:
+        return ""
+    return "\n".join(
+        f"- [{item['scenario']}] {item['directive']} "
+        f"(置信度 {float(item['confidence']):.2f})"
+        for item in items
+    )
 
 
-# ── 中期记忆 (History) ──────────────────────────────────────────────────────
+def remove_profile_scenario(
+    scenario_name: str,
+    user_id: str = DEFAULT_USER_ID,
+) -> None:
+    content = _base_profile(user_id)
+    pattern = rf"\n## 场景:{re.escape(scenario_name)}\b.*?(?=\n## |\Z)"
+    write_profile(re.sub(pattern, "", content, flags=re.DOTALL), user_id)
 
 
-def init_history_file():
-    """初始化 history.jsonl（创建 metadata 行）"""
-    _ensure_history_file()
+def _migrate_legacy_history() -> None:
+    """Import the old JSONL once, without deleting or rewriting it."""
+    migration_key = "legacy_history_imported_v2"
+    if get_meta(migration_key) == "1":
+        return
+    if not HISTORY_FILE.exists():
+        set_meta(migration_key, "1")
+        return
+
+    session_id = ensure_session(DEFAULT_SESSION_ID, DEFAULT_USER_ID, "默认")
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                item = json.loads(raw)
+                if item.get("type") == "metadata":
+                    continue
+                role = "agent" if item.get("role") == "agent" else "user"
+                add_message(
+                    session_id=session_id,
+                    user_id=DEFAULT_USER_ID,
+                    role=role,
+                    content=str(item.get("content", "")),
+                    scenario=str(item.get("scenario") or "默认"),
+                    summary=str(item.get("summary") or ""),
+                    intent=str(item.get("intent") or ""),
+                    created_at=str(item.get("timestamp") or datetime.now().isoformat()),
+                    # Avoid reconsolidating legacy rows that already contributed
+                    # to the existing Markdown profile.
+                    dream_processed=True,
+                    metadata={"migrated_from": "history.jsonl"},
+                )
+    finally:
+        set_meta(migration_key, "1")
+
+
+def init_memory_system() -> None:
+    _ensure_dirs()
+    init_memory_db()
+    _migrate_legacy_history()
+    _base_profile(DEFAULT_USER_ID)
+
+
+def init_history_file() -> None:
+    """Legacy entry point retained for startup compatibility."""
+    init_memory_system()
 
 
 def append_history(
@@ -107,120 +205,94 @@ def append_history(
     summary: str = "",
     intent: str = "",
     scenario: str = "默认",
-):
-    """
-    追加一条对话记录到 history.jsonl
-
-    Args:
-        role: 角色 (user/agent)
-        content: 消息内容
-        summary: 消息摘要
-        intent: 意图标签
-        scenario: 场景标签
-    """
-    _ensure_history_file()
-    lines = _read_all_lines()
-
-    # 构造新记录
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "role": role,
-        "content": content,
-        "summary": summary,
-        "intent": intent,
-        "scenario": scenario,
-    }
-
-    # 分离 metadata 和对话记录
-    metadata = lines[0] if lines and lines[0].get("type") == "metadata" else {
-        "type": "metadata",
-        "dream_offset": 0,
-        "clear_offset": 0,
-        "created_at": datetime.now().isoformat(),
-    }
-    dialogues = [l for l in lines if l.get("type") != "metadata"]
-
-    # 追加新记录
-    dialogues.append(entry)
-
-    # FIFO: 保留最近 N 条
-    if len(dialogues) > MAX_HISTORY_ENTRIES:
-        overflow = len(dialogues) - MAX_HISTORY_ENTRIES
-        dialogues = dialogues[overflow:]
-        # 如果删除了已处理的记录，需要调整 offset
-        metadata["dream_offset"] = max(0, metadata["dream_offset"] - overflow)
-        metadata["clear_offset"] = max(0, metadata["clear_offset"] - overflow)
-
-    # 重写文件
-    _write_all_lines([metadata] + dialogues)
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    session_id: str = DEFAULT_SESSION_ID,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    init_memory_system()
+    normalized_role = (
+        "agent" if role == "agent" else "user" if role in {"user", "operator"} else role
+    )
+    return add_message(
+        session_id=ensure_session(session_id, user_id, scenario),
+        user_id=user_id,
+        role=normalized_role,
+        content=content,
+        scenario=scenario,
+        summary=summary,
+        intent=intent,
+        metadata=metadata,
+    )
 
 
-def read_all_history() -> List[Dict[str, Any]]:
-    """读取所有对话记录（不含 metadata）"""
-    lines = _read_all_lines()
-    return [l for l in lines if l.get("type") != "metadata"]
+def read_all_history(
+    user_id: str = DEFAULT_USER_ID,
+    session_id: str = DEFAULT_SESSION_ID,
+    *,
+    include_cleared: bool = True,
+) -> list[dict[str, Any]]:
+    init_memory_system()
+    return get_session_history(
+        session_id,
+        user_id,
+        include_cleared=include_cleared,
+        limit=5000,
+    )
 
 
-def read_history_from_offset() -> List[Dict[str, Any]]:
-    """从 dream_offset 读取新的对话记录"""
-    lines = _read_all_lines()
-    metadata = lines[0] if lines and lines[0].get("type") == "metadata" else {"dream_offset": 0}
-    dialogues = [l for l in lines if l.get("type") != "metadata"]
-    offset = metadata.get("dream_offset", 0)
-    return dialogues[offset:]
+def read_history_from_offset(user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
+    init_memory_system()
+    return get_pending_messages(user_id)
 
 
-def get_dream_offset() -> int:
-    """获取当前 dream_offset"""
-    lines = _read_all_lines()
-    if lines and lines[0].get("type") == "metadata":
-        return lines[0].get("dream_offset", 0)
-    return 0
+def get_dream_offset(user_id: str = DEFAULT_USER_ID) -> int:
+    """Compatibility metric: number of processed messages in the default session."""
+    history = read_all_history(user_id, include_cleared=True)
+    return sum(1 for item in history if item.get("dream_processed"))
 
 
-def update_dream_offset(new_offset: int):
-    """更新 dream_offset"""
-    _ensure_history_file()
-    lines = _read_all_lines()
-    if lines and lines[0].get("type") == "metadata":
-        lines[0]["dream_offset"] = new_offset
-        _write_all_lines(lines)
+def update_dream_offset(new_offset: int, user_id: str = DEFAULT_USER_ID) -> None:
+    history = read_all_history(user_id, include_cleared=True)
+    ids = [int(item["id"]) for item in history[: max(0, int(new_offset))]]
+    mark_messages_processed(ids)
 
 
-def get_clear_offset() -> int:
-    """获取当前 clear_offset"""
-    lines = _read_all_lines()
-    if lines and lines[0].get("type") == "metadata":
-        return lines[0].get("clear_offset", 0)
-    return 0
+def get_clear_offset(
+    user_id: str = DEFAULT_USER_ID,
+    session_id: str = DEFAULT_SESSION_ID,
+) -> int:
+    all_items = read_all_history(user_id, session_id, include_cleared=True)
+    visible_items = read_all_history(user_id, session_id, include_cleared=False)
+    return max(0, len(all_items) - len(visible_items))
 
 
-def update_clear_offset(new_offset: int):
-    """更新 clear_offset"""
-    _ensure_history_file()
-    lines = _read_all_lines()
-    if lines and lines[0].get("type") == "metadata":
-        lines[0]["clear_offset"] = new_offset
-        _write_all_lines(lines)
+def update_clear_offset(
+    new_offset: int,
+    user_id: str = DEFAULT_USER_ID,
+    session_id: str = DEFAULT_SESSION_ID,
+) -> None:
+    # Kept only for callers that still express clearing as an offset. The v2
+    # chat router uses memory_store.clear_session directly.
+    from services.memory_store import clear_session
+
+    if new_offset > 0:
+        clear_session(session_id, user_id)
 
 
-def reset_memory():
-    """重置用户记忆为初始状态：重置 user_profile.md + 清空 history.jsonl"""
+def pending_history_count(user_id: str = DEFAULT_USER_ID) -> int:
+    init_memory_system()
+    return count_pending_messages(user_id)
+
+
+def reset_memory(user_id: str = DEFAULT_USER_ID) -> None:
+    reset_user_memory(user_id)
     _ensure_dirs()
-
-    # 重置 user_profile.md 为模板内容
+    profile_path = _profile_path(user_id)
     if TEMPLATE_PROFILE.exists():
-        PROFILE_FILE.write_text(
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(
             TEMPLATE_PROFILE.read_text(encoding="utf-8"), encoding="utf-8"
         )
-    elif PROFILE_FILE.exists():
-        PROFILE_FILE.unlink()
-
-    # 清空 history.jsonl，仅保留 metadata 行
-    metadata = {
-        "type": "metadata",
-        "dream_offset": 0,
-        "clear_offset": 0,
-        "created_at": datetime.now().isoformat(),
-    }
-    _write_all_lines([metadata])
+    elif profile_path.exists():
+        profile_path.unlink()

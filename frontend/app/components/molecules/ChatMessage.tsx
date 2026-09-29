@@ -134,7 +134,9 @@ function TrackCards({ tracks }: { tracks: TrackExt[] }) {
   const { fetchDanmaku } = useDanmaku();
   const inPlaylist = new Set([
     ...state.playlist.map((t) => t.id),
-    ...state.playlist.map((t) => t.bvid).filter(Boolean),
+    ...state.playlist
+      .map((t) => t.bvid)
+      .filter((bvid): bvid is string => Boolean(bvid)),
   ]);
 
   // Deduplicate by bvid to avoid duplicate React keys
