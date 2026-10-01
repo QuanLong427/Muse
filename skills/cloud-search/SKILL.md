@@ -20,19 +20,16 @@ description: 通过 B站 API 搜索云端视频资源，支持音乐、科普、
 2. 使用 `bili_search` 工具搜索B站视频（直接传入中文关键词即可）：
    bili_search(keyword="关键词")
    返回 JSON: { "total": number, "videos": [{ "bvid", "title", "author", "duration", "play", "pic" }] }
-3. 分析搜索结果，筛选最相关的视频（通常 5-10 个），以 tracks 格式输出
+3. 分析搜索结果，筛选最相关的视频（通常 5-10 个）
+4. 调用 `present_tracks(track_ids=[...])`，传入选中结果的精确 BVID；后端据此显示真实 Track 卡片
 
-### 输出格式
+### 输出约束
 
-搜索结果以 ```tracks 代码块输出，每个对象包含 bvid、title、author、duration、url 字段：
-
-```tracks
-[
-  {"bvid":"BV1xxxxx","title":"视频标题","author":"UP主","duration":"4:32","url":"https://www.bilibili.com/video/BV1xxxxx"},
-  {"bvid":"BV2yyyyy","title":"视频标题2","author":"UP主2","duration":"12:05","url":"https://www.bilibili.com/video/BV2yyyyy"}
-]
-```
+- 不要把 `bili_search` 写成 Bash、代码块或命令示例，必须发出真实工具调用
+- 不要重新生成搜索结果 JSON；Track 卡片由后端从工具结果构造
+- 只能把本轮 `bili_search` 返回的视频描述成在线候选，不得自行补写 BVID、UP 主或可下载状态
+- `Hi-Res`、`无损`、`原唱`等只能描述为视频标题中的来源方声明，未核验时不能直接断言
 
 ### 搜索后的下一步
 
-搜索到结果后，**提示用户是否需要转换下载**。只有用户确认后，才调用 `convert_video` 工具将视频转为音频并添加到本地曲库。
+搜索到结果后展示下载动作，并提示用户点击卡片的 DOWNLOAD 确认具体版本。只有客户端提交结构化 `selected_tracks` 后，才调用 `convert_video` 将视频转为音频并登记到本地曲库；普通文本确认不构成下载授权。

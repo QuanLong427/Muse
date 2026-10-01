@@ -27,6 +27,14 @@ def _resolve_wiki_dir() -> str:
     return str(PROJECT_ROOT / p)
 
 
+def _resolve_optional_path(env_name: str) -> str:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    return str(path if path.is_absolute() else PROJECT_ROOT / path)
+
+
 class Settings:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_BASE_URL: str = os.getenv(
@@ -39,8 +47,17 @@ class Settings:
     QWEN_AGENT_THINKING_BUDGET: int = int(
         os.getenv("QWEN_AGENT_THINKING_BUDGET", "2048")
     )
+    VOICE_ASR_MODEL: str = os.getenv("VOICE_ASR_MODEL", "qwen3-asr-flash")
+    VOICE_TTS_MODEL: str = os.getenv(
+        "VOICE_TTS_MODEL", "qwen-audio-3.0-tts-flash"
+    )
+    VOICE_TTS_VOICE: str = os.getenv("VOICE_TTS_VOICE", "longanhuan_v3.6")
     MUSIC_DIR: str = _resolve_music_dir()
     WIKI_DIR: str = _resolve_wiki_dir()
+    BILIBILI_COOKIES_FILE: str = _resolve_optional_path("BILIBILI_COOKIES_FILE")
+    BILIBILI_DOWNLOAD_TIMEOUT_SECONDS: int = max(
+        60, min(int(os.getenv("BILIBILI_DOWNLOAD_TIMEOUT_SECONDS", "300")), 900)
+    )
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("BACKEND_PORT", "8000"))
     DREAM_INTERVAL_HOURS: int = int(os.getenv("DREAM_INTERVAL_HOURS", "24"))

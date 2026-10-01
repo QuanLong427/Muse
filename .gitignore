@@ -12,6 +12,9 @@ node_modules
 # testing
 /coverage
 /backend/.pytest-tmp/
+/backend/.pytest_cache/
+/secrets/*
+!/secrets/.gitkeep
 
 # next.js
 /frontend/.next/
@@ -53,6 +56,8 @@ openspec/
 # ── User data (generated at runtime) ─────────────────────────
 memory/data/
 db/scenario.yml
+/db/wiki-sync.db*
+/db/wiki-reset-manifests/
 /.cache/
 
 # ── LLM-Wiki knowledge base (generated) ─────────────────────

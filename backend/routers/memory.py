@@ -1,4 +1,4 @@
-"""Inspectable management API for the v2 memory system."""
+"""Inspectable management API for the Musicer memory system."""
 
 from fastapi import APIRouter, Query
 
@@ -6,7 +6,9 @@ from services.memory_manager import pending_history_count, sync_profile_projecti
 from services.memory_store import (
     DEFAULT_USER_ID,
     forget_memory_item,
+    list_memory_episodes,
     list_memory_items,
+    search_memory_episodes,
     search_messages,
 )
 
@@ -44,6 +46,32 @@ async def search_memory(
             limit=limit,
         ),
     }
+
+
+@router.get("/api/memory/episodes")
+async def get_memory_episodes(
+    q: str | None = Query(None, min_length=1, max_length=300),
+    user_id: str = Query(DEFAULT_USER_ID, max_length=128),
+    scenario: str | None = Query(None, max_length=80),
+    episode_type: str | None = Query(None, max_length=80),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Inspect or search structured, attributable turn episodes."""
+    if q:
+        episodes = search_memory_episodes(
+            q,
+            user_id=user_id,
+            scenario=scenario,
+            limit=min(limit, 10),
+        )
+    else:
+        episodes = list_memory_episodes(
+            user_id,
+            scenario=scenario,
+            episode_type=episode_type,
+            limit=limit,
+        )
+    return {"query": q, "user_id": user_id, "episodes": episodes}
 
 
 @router.delete("/api/memory/items/{memory_key}")

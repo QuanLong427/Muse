@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from config import settings
-from services.wiki_manager import audit_wiki_quality, init_wiki, get_wiki_status
+from services.wiki_manager import audit_wiki_quality, get_wiki_status, init_wiki, reset_wiki
 from services.wiki_ingest import ingest_song
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,15 @@ async def wiki_status():
 async def wiki_audit():
     """Audit knowledge provenance and graph integrity without modifying data."""
     return await asyncio.to_thread(audit_wiki_quality, settings.WIKI_DIR)
+
+
+@router.post("/reset")
+async def wiki_reset():
+    """Reset generated Wiki data without deleting local music files."""
+    try:
+        return await asyncio.to_thread(reset_wiki)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/ingest")

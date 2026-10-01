@@ -2,7 +2,8 @@
 
 The store intentionally separates three concerns:
 
-* sessions/messages: lossless episodic history and short-term recall;
+* sessions/messages: attributable raw interaction events and short-term recall;
+* memory_episodes: structured past interactions used as episodic memory;
 * memory_candidates: auditable proposals produced by Dream;
 * memory_items: small, curated directives that may be injected into prompts.
 
@@ -14,6 +15,8 @@ threads while WAL mode and transactions serialize writes safely.
 from __future__ import annotations
 
 import json
+import math
+import re
 import sqlite3
 import threading
 import uuid
@@ -52,7 +55,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_memory_db() -> None:
-    """Create or upgrade the v2 memory schema."""
+    """Create or upgrade the memory schema."""
     global _initialized_path
     resolved_path = str(MEMORY_DB_PATH.resolve())
     if _initialized_path == resolved_path and MEMORY_DB_PATH.exists():
@@ -107,6 +110,35 @@ def init_memory_db() -> None:
                     ON memory_messages(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_memory_messages_user_dream
                     ON memory_messages(user_id, dream_processed, id);
+
+                CREATE TABLE IF NOT EXISTS memory_episodes (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    scenario TEXT NOT NULL DEFAULT '默认',
+                    episode_type TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    constraints_json TEXT NOT NULL DEFAULT '[]',
+                    action_summary TEXT NOT NULL DEFAULT '',
+                    result_status TEXT NOT NULL,
+                    result_summary TEXT NOT NULL DEFAULT '',
+                    user_feedback TEXT NOT NULL DEFAULT '',
+                    source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    entity_refs_json TEXT NOT NULL DEFAULT '{}',
+                    search_text TEXT NOT NULL DEFAULT '',
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_accessed_at TEXT,
+                    FOREIGN KEY(user_id) REFERENCES memory_users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(session_id) REFERENCES memory_sessions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_episodes_user_created
+                    ON memory_episodes(user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_memory_episodes_context
+                    ON memory_episodes(user_id, scenario, episode_type, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     id TEXT PRIMARY KEY,
@@ -163,7 +195,7 @@ def init_memory_db() -> None:
                 """
             )
             conn.execute(
-                "INSERT OR REPLACE INTO memory_meta(key, value) VALUES('schema_version', '2')"
+                "INSERT OR REPLACE INTO memory_meta(key, value) VALUES('schema_version', '3')"
             )
             conn.commit()
             _initialized_path = resolved_path
@@ -403,6 +435,246 @@ def search_messages(
         params.append(safe_limit)
         rows = conn.execute(sql, params).fetchall()
         return [_message_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _episode_dict(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["context"] = json.loads(item.pop("context_json") or "{}")
+    item["constraints"] = json.loads(item.pop("constraints_json") or "[]")
+    item["source_message_ids"] = json.loads(
+        item.pop("source_message_ids_json") or "[]"
+    )
+    item["entity_refs"] = json.loads(item.pop("entity_refs_json") or "{}")
+    return item
+
+
+def _bounded_score(value: float) -> float:
+    return max(0.0, min(float(value), 1.0))
+
+
+def create_memory_episode(
+    *,
+    user_id: str,
+    session_id: str,
+    scenario: str,
+    episode_type: str,
+    goal: str,
+    context: dict[str, Any] | None = None,
+    constraints: Iterable[str] = (),
+    action_summary: str = "",
+    result_status: str = "success",
+    result_summary: str = "",
+    user_feedback: str = "",
+    source_message_ids: Iterable[int] = (),
+    entity_refs: dict[str, Any] | None = None,
+    importance: float = 0.5,
+    confidence: float = 1.0,
+) -> dict[str, Any]:
+    """Store a compact, attributable episode derived from one completed turn."""
+    user_id = ensure_user(user_id)
+    session_id = ensure_session(session_id, user_id, scenario)
+    goal = goal.strip()[:2000]
+    if not goal:
+        raise ValueError("episode goal must not be empty")
+    result_status = result_status.strip().lower()
+    if result_status not in {"success", "partial", "failed"}:
+        raise ValueError(f"unsupported episode result status: {result_status}")
+
+    requested_sources = sorted({int(value) for value in source_message_ids})
+    valid_sources: list[int] = []
+    conn = _connect()
+    try:
+        if requested_sources:
+            placeholders = ",".join("?" for _ in requested_sources)
+            rows = conn.execute(
+                f"""
+                SELECT id FROM memory_messages
+                WHERE user_id = ? AND session_id = ? AND id IN ({placeholders})
+                """,
+                [user_id, session_id, *requested_sources],
+            ).fetchall()
+            valid_sources = sorted(int(row["id"]) for row in rows)
+
+        normalized_constraints = [
+            str(value).strip()[:300]
+            for value in constraints
+            if str(value).strip()
+        ][:20]
+        normalized_entities = entity_refs or {}
+        searchable_parts = [
+            goal,
+            action_summary,
+            result_summary,
+            user_feedback,
+            " ".join(normalized_constraints),
+            json.dumps(normalized_entities, ensure_ascii=False, default=str),
+        ]
+        now = _now()
+        episode_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO memory_episodes(
+                id, user_id, session_id, scenario, episode_type, goal,
+                context_json, constraints_json, action_summary, result_status,
+                result_summary, user_feedback, source_message_ids_json,
+                entity_refs_json, search_text, importance, confidence,
+                created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                episode_id,
+                user_id,
+                session_id,
+                (scenario or "默认").strip()[:80],
+                episode_type.strip()[:80] or "conversation",
+                goal,
+                _json(context or {}),
+                _json(normalized_constraints),
+                action_summary.strip()[:2000],
+                result_status,
+                result_summary.strip()[:4000],
+                user_feedback.strip()[:1000],
+                _json(valid_sources),
+                _json(normalized_entities),
+                "\n".join(part for part in searchable_parts if part).lower()[:12000],
+                _bounded_score(importance),
+                _bounded_score(confidence),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM memory_episodes WHERE id = ?", (episode_id,)
+        ).fetchone()
+        return _episode_dict(row)
+    finally:
+        conn.close()
+
+
+def list_memory_episodes(
+    user_id: str = DEFAULT_USER_ID,
+    *,
+    scenario: str | None = None,
+    episode_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    init_memory_db()
+    sql = "SELECT * FROM memory_episodes WHERE user_id = ?"
+    params: list[Any] = [user_id]
+    if scenario:
+        sql += " AND scenario = ?"
+        params.append(scenario)
+    if episode_type:
+        sql += " AND episode_type = ?"
+        params.append(episode_type)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 200)))
+    conn = _connect()
+    try:
+        return [_episode_dict(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _search_terms(text: str) -> set[str]:
+    normalized = re.sub(r"\s+", "", text.lower())
+    terms = set(re.findall(r"[a-z0-9_-]{2,}", normalized))
+    for segment in re.findall(r"[\u3400-\u9fff]+", normalized):
+        if len(segment) == 1:
+            terms.add(segment)
+        else:
+            terms.update(segment[index : index + 2] for index in range(len(segment) - 1))
+    return terms
+
+
+def _age_days(timestamp: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
+    except (TypeError, ValueError):
+        return 365.0
+
+
+def search_memory_episodes(
+    query: str,
+    user_id: str = DEFAULT_USER_ID,
+    *,
+    scenario: str | None = None,
+    limit: int = 3,
+    min_score: float = 0.22,
+) -> list[dict[str, Any]]:
+    """Rank episodes using lexical relevance, context, recency and salience.
+
+    Chinese bigrams are used instead of SQLite FTS so unsegmented queries work
+    without an external tokenizer.  The stable API leaves room for a vector or
+    hybrid index later.
+    """
+    init_memory_db()
+    query = query.strip()
+    if not query:
+        return []
+    query_terms = _search_terms(query)
+    explicit_recall = bool(
+        re.search(r"上次|之前|以前|还记得|刚才|前面|像上回|继续|历史", query)
+    )
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM memory_episodes
+            WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT 300
+            """,
+            (user_id,),
+        ).fetchall()
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        normalized_query = re.sub(r"\s+", "", query.lower())
+        for row in rows:
+            item = _episode_dict(row)
+            document = str(item.get("search_text") or "").lower()
+            document_terms = _search_terms(document)
+            overlap = len(query_terms & document_terms) / max(len(query_terms), 1)
+            if overlap == 0 and not explicit_recall:
+                continue
+            exact_bonus = (
+                0.2
+                if normalized_query
+                and normalized_query in re.sub(r"\s+", "", document)
+                else 0.0
+            )
+            scenario_bonus = 0.08 if scenario and item["scenario"] == scenario else 0.0
+            recency = math.exp(-_age_days(item["created_at"]) / 45.0)
+            status_bonus = 0.03 if item["result_status"] == "success" else 0.0
+            score = (
+                0.62 * overlap
+                + exact_bonus
+                + scenario_bonus
+                + 0.12 * recency
+                + 0.08 * float(item["importance"])
+                + 0.04 * float(item["confidence"])
+                + status_bonus
+            )
+            if explicit_recall and overlap == 0:
+                score += 0.08 * recency
+            if score >= min_score:
+                item["retrieval_score"] = round(min(score, 1.0), 4)
+                ranked.append((score, item))
+
+        ranked.sort(key=lambda pair: (pair[0], pair[1]["created_at"]), reverse=True)
+        selected = [item for _, item in ranked[: max(1, min(int(limit), 10))]]
+        if selected:
+            accessed_at = _now()
+            conn.executemany(
+                "UPDATE memory_episodes SET last_accessed_at = ? WHERE id = ?",
+                [(accessed_at, item["id"]) for item in selected],
+            )
+            conn.commit()
+        return selected
     finally:
         conn.close()
 

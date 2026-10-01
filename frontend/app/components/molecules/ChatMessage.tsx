@@ -2,12 +2,11 @@
 
 import type { CSSProperties } from "react";
 import { useState } from "react";
-import type { Track } from "@/app/lib/types";
+import type { Track, TrackCardData } from "@/app/lib/types";
 import type { ChatMessage as ChatMessageModel } from "@/app/lib/types";
 import { usePlayer } from "@/app/context/PlayerContext";
-import { useAgent, type ConvertTrack } from "@/app/context/AgentContext";
+import { useAgent } from "@/app/context/AgentContext";
 import { useDanmaku } from "@/app/context/DanmakuContext";
-import { apiUrl } from "@/app/lib/api";
 import { useMemo } from "react";
 
 type Props = { message: ChatMessageModel };
@@ -110,27 +109,40 @@ function parseContent(content: string): ContentPart[] {
 
 type TrackExt = Track & { bvid?: string; duration?: string };
 
-type ButtonState = "add" | "adding" | "added";
+function legacyTrackCard(track: TrackExt): TrackCardData {
+  const local = Boolean(track.filename);
+  return {
+    track_id: local ? track.id : `bilibili:${track.bvid || track.id}`,
+    source_type: local ? "local" : "bilibili",
+    availability: local ? "local" : "remote",
+    title: track.title,
+    author: track.author,
+    duration: track.duration,
+    bvid: track.bvid,
+    url: track.url,
+    download_status: "idle",
+    allowed_actions: local ? ["play", "add_to_queue"] : ["download"],
+    local_track: local ? track : null,
+  };
+}
+
+type ButtonState = "add" | "adding" | "added" | "downloaded";
 
 function getButtonState(
   track: TrackExt,
   inPlaylist: Set<string>,
   convertingSet: Set<string>,
+  convertedSet: Set<string>,
 ): ButtonState {
   if (inPlaylist.has(track.id) || (track.bvid && inPlaylist.has(track.bvid))) return "added";
   if (track.bvid && convertingSet.has(track.bvid)) return "adding";
+  if (track.bvid && convertedSet.has(track.bvid)) return "downloaded";
   return "add";
 }
 
-const BTN_CONFIG: Record<ButtonState, { label: string; disabled: boolean }> = {
-  add: { label: "+ ADD", disabled: false },
-  adding: { label: "ADDING...", disabled: true },
-  added: { label: "ADDED", disabled: true },
-};
-
-function TrackCards({ tracks }: { tracks: TrackExt[] }) {
+function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardData[] }) {
   const { state, addTracks, playTrack } = usePlayer();
-  const { queueConvert, convertingSet } = useAgent();
+  const { queueConvert, convertingSet, convertedSet } = useAgent();
   const { fetchDanmaku } = useDanmaku();
   const inPlaylist = new Set([
     ...state.playlist.map((t) => t.id),
@@ -140,61 +152,36 @@ function TrackCards({ tracks }: { tracks: TrackExt[] }) {
   ]);
 
   // Deduplicate by bvid to avoid duplicate React keys
+  const normalizedCards = useMemo(
+    () => cards ?? (tracks ?? []).map(legacyTrackCard),
+    [cards, tracks]
+  );
   const uniqueTracks = useMemo(() => {
     const seen = new Set<string>();
-    return tracks.filter((t) => {
-      const key = t.bvid || t.id;
+    return normalizedCards.filter((t) => {
+      const key = t.bvid || t.track_id;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [tracks]);
+  }, [normalizedCards]);
 
-  const isCloud = uniqueTracks.some((t) => !t.filename);
-
-  const allDone = uniqueTracks.every((t) => {
-    const s = getButtonState(t, inPlaylist, convertingSet);
-    return s === "added";
-  });
-
-  const handleAdd = async (track: TrackExt) => {
-    if (track.filename) {
-      // Local track — add directly
-      addTracks([track]);
-      if (track.bvid) fetchDanmaku(track.bvid);
-      playTrack(track);
-    } else if (track.bvid) {
-      // Cloud track — check if local file exists first
-      try {
-        const res = await fetch(apiUrl(`/api/tracks/by-bvid?bvid=${encodeURIComponent(track.bvid)}`));
-        if (res.ok) {
-          const localTrack: Track = await res.json();
-          addTracks([localTrack]);
-          fetchDanmaku(track.bvid);
-          playTrack(localTrack);
-          return;
-        }
-      } catch {
-        // ignore fetch error, fall through to conversion
-      }
-      // No local file — need conversion
-      queueConvert([{ bvid: track.bvid, title: track.title, author: track.author }]);
-      fetchDanmaku(track.bvid);
-    }
+  const handleDownload = (track: TrackCardData) => {
+    if (!track.bvid) return;
+    queueConvert([{ bvid: track.bvid, title: track.title, author: track.author }]);
+    fetchDanmaku(track.bvid);
   };
 
-  const handleAddAll = () => {
-    if (isCloud) {
-      const cloudTracks = tracks
-        .filter((t) => !t.filename && t.bvid && getButtonState(t, inPlaylist, convertingSet) === "add")
-        .map((t): ConvertTrack => ({ bvid: t.bvid!, title: t.title, author: t.author }));
-      if (cloudTracks.length) {
-        queueConvert(cloudTracks);
-        cloudTracks.forEach((t) => fetchDanmaku(t.bvid));
-      }
-    } else {
-      addTracks(tracks);
-    }
+  const handleQueue = (track: TrackCardData) => {
+    if (!track.local_track) return;
+    addTracks([track.local_track]);
+    if (track.bvid) fetchDanmaku(track.bvid);
+  };
+
+  const handlePlay = (track: TrackCardData) => {
+    if (!track.local_track) return;
+    playTrack(track.local_track);
+    if (track.bvid) fetchDanmaku(track.bvid);
   };
 
   return (
@@ -205,22 +192,15 @@ function TrackCards({ tracks }: { tracks: TrackExt[] }) {
         <span className="text-[11px] font-medium uppercase tracking-wider text-[color:var(--color-on-surface-muted)]">
           [{uniqueTracks.length} TRACKS]
         </span>
-        <button
-          onClick={handleAddAll}
-          disabled={allDone}
-          className="rounded-full border border-[rgba(129,140,248,0.3)] bg-[rgba(129,140,248,0.1)] px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wider transition-all duration-200 disabled:opacity-40 hover:bg-[rgba(129,140,248,0.2)]"
-          style={{ color: "var(--color-primary)" }}
-        >
-          {allDone ? "ALL_ADDED" : "ADD_ALL"}
-        </button>
       </div>
       <div className="max-h-[16rem] overflow-y-auto">
         {uniqueTracks.map((t) => {
-          const btnState = getButtonState(t, inPlaylist, convertingSet);
-          const cfg = BTN_CONFIG[btnState];
+          const localTrack = t.local_track;
+          const legacyForState = localTrack ?? ({ id: t.track_id, bvid: t.bvid } as TrackExt);
+          const btnState = getButtonState(legacyForState, inPlaylist, convertingSet, convertedSet);
           return (
             <div
-              key={t.bvid || t.id}
+              key={t.bvid || t.track_id}
               className="flex items-center gap-2 border-b border-[var(--glass-border)] last:border-b-0 px-3 py-2"
             >
               <div className="min-w-0 flex-1">
@@ -245,17 +225,23 @@ function TrackCards({ tracks }: { tracks: TrackExt[] }) {
                   {t.duration && <span className="ml-2 opacity-70">{t.duration}</span>}
                 </p>
               </div>
-              <button
-                onClick={() => handleAdd(t)}
-                disabled={cfg.disabled}
-                className="shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wider transition-all duration-200 disabled:opacity-40 hover:bg-[rgba(129,140,248,0.15)]"
-                style={{
-                  borderColor: cfg.disabled ? "var(--glass-border)" : "rgba(129,140,248,0.3)",
-                  color: cfg.disabled ? "var(--color-on-surface-muted)" : "var(--color-primary)",
-                }}
-              >
-                {cfg.label}
-              </button>
+              <div className="flex shrink-0 items-center gap-1">
+                {t.allowed_actions.includes("play") && (
+                  <button onClick={() => handlePlay(t)} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase" style={{ color: "var(--color-primary)" }}>
+                    ▶ PLAY
+                  </button>
+                )}
+                {t.allowed_actions.includes("add_to_queue") && (
+                  <button onClick={() => handleQueue(t)} disabled={btnState === "added"} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
+                    {btnState === "added" ? "ADDED" : "+ ADD"}
+                  </button>
+                )}
+                {t.allowed_actions.includes("download") && (
+                  <button onClick={() => handleDownload(t)} disabled={btnState === "adding" || btnState === "downloaded"} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
+                    {btnState === "adding" ? "DOWNLOADING..." : btnState === "downloaded" ? "DOWNLOADED" : "⇩ DOWNLOAD"}
+                  </button>
+                )}
+              </div>
             </div>
           );
         })}
@@ -332,7 +318,7 @@ export function ChatMessage({ message: m }: Props) {
   const isOp = m.role === "operator";
   const label = labelFor(m.role);
 
-  const parts = m.role === "agent" ? parseContent(m.content) : null;
+  const parts = m.role === "agent" && m.content ? parseContent(m.content) : null;
 
   const wrapperClass = isOp
     ? "justify-end"
@@ -364,6 +350,7 @@ export function ChatMessage({ message: m }: Props) {
           </span>
           <span className="text-[10px] text-[color:var(--color-on-surface-muted)] opacity-60">{formatTs(m.timestamp)}</span>
         </div>
+        {m.trackCards?.length ? <TrackCards cards={m.trackCards} /> : null}
         {parts ? (
           <div className={isOp ? "text-right" : "text-left"}>
             {parts.map((part, i) => {
@@ -379,14 +366,14 @@ export function ChatMessage({ message: m }: Props) {
               );
             })}
           </div>
-        ) : (
+        ) : m.content ? (
           <pre
             className={`m-0 whitespace-pre-wrap break-words text-sm leading-relaxed ${isOp ? "text-right" : "text-left"}`}
             style={{ fontFamily: "var(--font-body)", color: "var(--color-on-surface)" }}
           >
             {m.content}
           </pre>
-        )}
+        ) : null}
       </div>
     </article>
   );

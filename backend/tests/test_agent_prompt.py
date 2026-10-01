@@ -14,6 +14,8 @@ def test_system_prompt_uses_react_principles_instead_of_fixed_tool_routes():
     assert "不预设固定工具顺序" in prompt
     assert "## 可用 Agent Skills" in prompt
     assert "llm-wiki" in prompt
+    assert "不得用代码块、命令文本或函数调用示例代替真实工具调用" in prompt
+    assert "不要重新输出 tracks JSON" in prompt
 
     assert "必须使用提供的工具" not in prompt
     assert "路由优先级" not in prompt
@@ -49,3 +51,14 @@ def test_system_prompt_includes_global_and_current_scenario_profile(monkeypatch)
     assert "优先高节奏音乐" in prompt
     assert "优先轻音乐" not in prompt
     assert "不要推荐慢歌" in prompt
+
+
+def test_system_prompt_includes_only_preselected_episode_context():
+    prompt = _build_system_prompt(
+        "默认",
+        "user-a",
+        episode_context="## 与当前请求相关的过往事件\n- 夜跑歌单不要慢歌",
+    )
+
+    assert "与当前请求相关的过往事件" in prompt
+    assert "夜跑歌单不要慢歌" in prompt

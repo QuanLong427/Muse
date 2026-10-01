@@ -11,8 +11,9 @@ from services.wiki_ingest import (
     _update_cache,
     _validate_evidence_grounding,
     _validate_step1,
+    ingest_song,
 )
-from services.wiki_manager import audit_wiki_quality
+from services.wiki_manager import audit_wiki_quality, init_wiki
 
 
 def _valid_analysis():
@@ -125,3 +126,77 @@ def test_wiki_audit_finds_legacy_and_provenance_problems(tmp_path):
     assert audit["issue_counts"]["broken_entity_link"] == 1
     assert audit["issue_counts"]["absolute_local_path"] == 1
     assert not audit["ready_for_verified_answers"]
+
+
+def _write_v3_entity(path, verification_status):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""---
+schema_version: "3.0"
+entity_type: song
+verification_status: {verification_status}
+confidence: 0.9
+---
+# Test
+
+## Evidence
+- `raw.original_title`: Test
+""",
+        encoding="utf-8",
+    )
+
+
+def test_wiki_audit_does_not_treat_inferred_entities_as_verified(tmp_path):
+    (tmp_path / ".wiki-schema.md").write_text("- version: 3.0\n", encoding="utf-8")
+    _write_v3_entity(tmp_path / "wiki/entities/songs/Test.md", "inferred")
+
+    audit = audit_wiki_quality(str(tmp_path))
+
+    assert audit["structurally_valid"] is True
+    assert audit["verification_counts"]["inferred"] == 1
+    assert audit["ready_for_inferred_answers"] is True
+    assert audit["ready_for_verified_answers"] is False
+
+
+def test_wiki_audit_requires_at_least_one_verified_entity(tmp_path):
+    (tmp_path / ".wiki-schema.md").write_text("- version: 3.0\n", encoding="utf-8")
+
+    empty_audit = audit_wiki_quality(str(tmp_path))
+    assert empty_audit["structurally_valid"] is True
+    assert empty_audit["ready_for_verified_answers"] is False
+
+    _write_v3_entity(tmp_path / "wiki/entities/songs/Verified.md", "verified")
+    verified_audit = audit_wiki_quality(str(tmp_path))
+    assert verified_audit["verification_counts"]["verified"] == 1
+    assert verified_audit["ready_for_verified_answers"] is True
+
+
+def test_ingest_never_renames_local_audio(tmp_path, monkeypatch):
+    music_dir = tmp_path / "music"
+    wiki_dir = tmp_path / "wiki"
+    audio_path = music_dir / "album" / "旧歌手-测试歌曲--BV1stable.mp3"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"stable audio bytes")
+    init_wiki(str(wiki_dir))
+    monkeypatch.setattr("services.wiki_ingest.settings.MUSIC_DIR", str(music_dir))
+    monkeypatch.setattr(
+        "services.wiki_ingest._call_llm",
+        lambda _prompt: json.dumps(_valid_analysis(), ensure_ascii=False),
+    )
+
+    result = ingest_song(
+        {
+            "title": "晴天",
+            "artist": "周杰伦",
+            "video_title": "周杰伦-晴天",
+            "bvid": "BV1stable",
+            "local_file_path": str(audio_path),
+        },
+        str(wiki_dir),
+    )
+
+    assert result["status"] == "ingested"
+    assert audio_path.read_bytes() == b"stable audio bytes"
+    assert not (audio_path.parent / "周杰伦-测试歌曲-BV1stable.mp3").exists()
+    raw_content = (wiki_dir / "raw/songs/BV1stable.md").read_text(encoding="utf-8")
+    assert 'local_relative_path: "album/旧歌手-测试歌曲--BV1stable.mp3"' in raw_content

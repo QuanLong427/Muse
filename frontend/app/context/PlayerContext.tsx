@@ -128,17 +128,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       syncToBackend(next);
       return next;
     });
-
-    if (indexRef.current < 0) {
-      const cur = playlistRef.current;
-      const first = cur[0];
-      if (first) {
-        setIndex(0);
-        indexRef.current = 0;
-        playTrack(first);
-      }
-    }
-  }, [playTrack, syncToBackend]);
+  }, [syncToBackend]);
 
   const removeTrack = useCallback(
     (trackId: string) => {
@@ -208,11 +198,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           indexRef.current = i;
           playTrack(track);
         } else {
-          const single = [track];
-          setPlaylist(single);
-          playlistRef.current = single;
-          setIndex(0);
-          indexRef.current = 0;
+          const nextPl = [...cur, track];
+          const nextIndex = nextPl.length - 1;
+          setPlaylist(nextPl);
+          playlistRef.current = nextPl;
+          syncToBackend(nextPl);
+          setIndex(nextIndex);
+          indexRef.current = nextIndex;
           playTrack(track);
         }
       }

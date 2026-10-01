@@ -6,15 +6,6 @@ pydantic>=2.0.0
 langgraph>=0.4.0
 langchain-openai>=0.3.0
 langchain-core>=0.3.0
+yt-dlp[default,curl-cffi]==2026.8.19
 
-# ── 外部工具 ──────────────────────────────────────────────────────────────────
-# bv2mp3: B站视频转MP3工具
-# 安装: npm install -g bv2mp3
-# 或安装到用户目录: npm install -g bv2mp3 --prefix ~/.npm-global
-# 使用: ~/.npm-global/bv2mp3 --url=<B站视频URL>
-
-# ffmpeg: 音视频格式转换工具（bv2mp3 依赖）
-# 安装 (Windows): winget install Gyan.FFmpeg --source winget
-# 安装 (macOS): brew install ffmpeg
-# 安装 (Linux): sudo apt install ffmpeg
-# 验证: ffmpeg -version
+# ffmpeg 由 Docker 镜像安装，供 yt-dlp 提取和转换 MP3。

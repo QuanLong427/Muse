@@ -13,10 +13,11 @@ description: 将 B站视频转为 MP3 音频文件，支持批量转换和自动
 1. **使用 `convert_video` 工具执行转换，不要使用 bash**
 2. **不要使用 which、find、ls 或任何命令探索/验证路径**
 3. **直接调用工具，无需验证**
-4. **工具内部使用 `npx bv2mp3 --threads 20` 执行转换**
+4. **工具内部使用 yt-dlp 串行下载并调用 ffmpeg 转换**；不要自行提高并发或重复调用
 5. **必须等待 `convert_video` 工具返回结果后，才能执行后续步骤或输出结束语**
 6. **禁止在调用 convert_video 之前或期间输出"转换已启动"、"请稍候"等结束语**
 7. **必须传入 `song_meta_json` 参数，格式见下方，artist 和 title 必须从视频标题中解析出纯净的歌手名和歌名**
+8. 如果工具返回 `bilibili_request_blocked`，本轮禁止重试。应明确说明这是当前网络出口被 B 站风控；建议关闭 VPN、为 B 站域名配置直连，或配置有效浏览器 Cookie，等待用户处理后再试
 
 **Fallback 规则（工具内部自动处理）：**
 - `artist` 缺失 → 自动使用 `"Unknown"`
@@ -61,35 +62,16 @@ convert_video(
 
 `song_meta_json` 格式：JSON 数组字符串，每个元素包含 `bvid`（BV号）、`title`（纯净歌名）、`artist`（纯净歌手名）、`uploader`（UP主名字）、`videoTitle`（视频原始标题）。**title 和 artist 必须为空字符串以外的值**。
 
-### 2. 扫描曲库
+`convert_video` 内部会完成下载、转换、曲库扫描、规范 Track 构造和最小 Wiki 来源身份同步，并在 `tracks` 字段返回真实本地 Track。不要再调用 Bash、curl 或手工扫描目录，也不要自行拼接 URL。
 
-调用 `bash` 工具执行：
-```
-TODAY=$(date +%Y%m%d)
-curl -s -G "http://localhost:8000/api/tracks/scan" -d "subDir=$TODAY&baseDir=$MUSIC_DIR"
-```
+Wiki 来源身份同步只登记 BVID、文件路径、哈希和原始来源；它不执行 LLM 知识富化。歌手、专辑、版本等语义实体仍需按 `llm-wiki` Skill 的证据流程处理。
 
-返回 JSON: { "tracks": [{ "id", "title", "author", "url", ... }] }
+### 3. 结果处理
 
-### 3. 为每个 track 补上 bvid
+- 只有 `tracks` 中返回的本地 Track 才能描述为下载成功
+- `wiki_sync.status=failed` 不影响本地音频已经成功落盘，应如实分别报告
+- Track 卡片由后端自动生成，不要输出 `added`/`tracks` JSON 代码块
 
-根据 scan 结果和视频 BV 号，在 track 对象中添加 "bvid" 字段。**严禁遗漏 bvid 字段**
+### 4. 临时文件清理
 
-### 4. 将新增的 tracks 数据直接用 added 代码块输出
-
-```added
-[
-  {"id":"20250430/文件名.mp3","title":"标题","author":"作者","url":"/api/tracks/20250430/%E6%96%87%E4%BB%B6%E5%90%8D.mp3","date":"","filename":"文件名.mp3","subDir":"20250430","size":12345,"bvid":"BV1xxxxxx"}
-]
-```
-
-added 代码块规则：
-
-- 直接复制 scan API 返回的 track 对象，不要自行编造或修改 url 字段
-- 每个 track 对象**必须**包含 "bvid" 字段
-- 即使只有一个文件也用数组格式
-- **严禁**手动拼接 url，必须使用 scan API 返回的 url
-
-### 5. 清理 .flv 文件
-
-此步骤由 `convert_video` 工具自动执行，无需手动操作。工具返回的输出中会包含 `[cleanup] Deleted X .flv file(s)` 信息。
+此步骤由 `convert_video` 工具自动执行，无需手动操作。下载与转换的中间文件位于临时目录，成功、失败或超时后都会自动清理。

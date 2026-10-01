@@ -10,12 +10,29 @@ export interface Track {
   bvid?: string;
 }
 
+export type TrackAction = "play" | "download" | "add_to_queue" | "add_to_playlist";
+
+export interface TrackCardData {
+  track_id: string;
+  source_type: "local" | "bilibili";
+  availability: "local" | "remote" | "downloading" | "failed";
+  title: string;
+  author: string;
+  duration?: string;
+  bvid?: string | null;
+  url: string;
+  download_status: string;
+  allowed_actions: TrackAction[];
+  local_track?: Track | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: "agent" | "operator" | "system" | "tool";
   content: string;
   timestamp: number;
   toolName?: string;
+  trackCards?: TrackCardData[];
 }
 
 export interface PlayerState {

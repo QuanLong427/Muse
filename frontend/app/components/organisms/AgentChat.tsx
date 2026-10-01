@@ -7,6 +7,7 @@ import { ChatMessage } from "@/app/components/molecules/ChatMessage";
 import { CommandInput } from "@/app/components/molecules/CommandInput";
 import { ScenarioSelect } from "@/app/components/molecules/ScenarioSelect";
 import { useAgent } from "@/app/context/AgentContext";
+import { useVoiceRecorder } from "@/app/hooks/useVoiceRecorder";
 import { useEffect, useMemo, useRef } from "react";
 
 const ThinkingCard = (
@@ -37,9 +38,22 @@ const ThinkingCard = (
 );
 
 export function AgentChat() {
-  const { messages, loading, sessionId, sendMessage, cancel, currentScenario, setCurrentScenario } = useAgent();
+  const {
+    messages,
+    loading,
+    sessionId,
+    sendMessage,
+    cancel,
+    currentScenario,
+    setCurrentScenario,
+    voiceOutputEnabled,
+    voiceSpeaking,
+    voiceOutputError,
+    toggleVoiceOutput,
+  } = useAgent();
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const voiceInput = useVoiceRecorder((text) => void sendMessage(text));
 
   useEffect(() => {
     const el = listRef.current;
@@ -94,6 +108,24 @@ export function AgentChat() {
         </Label>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <ScenarioSelect value={currentScenario} onChange={setCurrentScenario} />
+          <button
+            type="button"
+            onClick={toggleVoiceOutput}
+            aria-label={voiceOutputEnabled ? "关闭语音播报" : "开启语音播报"}
+            aria-pressed={voiceOutputEnabled}
+            title={voiceOutputEnabled ? "语音播报已开启" : "语音播报已关闭"}
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-all ${
+              voiceOutputEnabled
+                ? "border-[rgba(129,140,248,0.45)] bg-[rgba(129,140,248,0.14)] text-[color:var(--color-primary)]"
+                : "border-[var(--glass-border)] bg-white/5 text-[color:var(--color-on-surface-muted)]"
+            }`}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path d="M5 9v6h4l5 4V5L9 9H5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+              <path d="M17 9a4 4 0 0 1 0 6M19 6.5a7.5 7.5 0 0 1 0 11" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+            </svg>
+          </button>
+          {voiceSpeaking && <Badge label="SPEAKING" variant="primary" />}
           {loading ? (
             <Badge label="THINKING" variant="primary" />
           ) : (
@@ -121,7 +153,11 @@ export function AgentChat() {
       <div className="shrink-0 border-t border-[var(--glass-border)] px-3 py-3 md:px-4">
         <div className="flex items-center gap-2">
           <div className="min-w-0 flex-1">
-            <CommandInput disabled={loading} onSubmit={(t) => void sendMessage(t)} />
+            <CommandInput
+              disabled={loading}
+              onSubmit={(t) => void sendMessage(t)}
+              voice={voiceInput}
+            />
           </div>
           {loading && (
             <button
@@ -148,6 +184,11 @@ export function AgentChat() {
             </button>
           )}
         </div>
+        {(voiceInput.error || voiceOutputError) && (
+          <p className="mt-1.5 px-1 text-[11px] text-red-300/90">
+            {voiceInput.error || voiceOutputError}
+          </p>
+        )}
       </div>
     </section>
   );

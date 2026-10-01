@@ -27,6 +27,7 @@ def test_player_tools_are_available_and_return_snapshot():
 
     assert "get_player_state" in tools
     assert "control_player" in tools
+    assert "play_track" in tools
     assert "search_memory" in tools
     assert "remember_preference" in tools
     assert "forget_preference" in tools
@@ -79,3 +80,28 @@ def test_extract_client_action_supports_langgraph_tool_message():
         "action": "next",
     }
     assert _extract_client_action("not-json") is None
+
+
+def test_play_track_dispatches_exact_canonical_track(monkeypatch):
+    from models import Track
+
+    track = Track(
+        id="20261001/周杰伦-最长的电影-BV1.mp3",
+        title="最长的电影",
+        author="周杰伦",
+        date="",
+        filename="周杰伦-最长的电影-BV1.mp3",
+        subDir="20261001",
+        size=1,
+        url="/api/tracks/20261001/song.mp3",
+        bvid="BV1",
+    )
+    monkeypatch.setattr("services.music_manager.find_track_by_id", lambda track_id: track)
+    result = json.loads(
+        _tools_by_name({"available": True})["play_track"].invoke({"track_id": track.id})
+    )
+
+    assert result["status"] == "dispatched"
+    assert result["client_action"]["action"] == "play_track"
+    assert result["client_action"]["track_id"] == track.id
+    assert result["client_action"]["track"]["title"] == "最长的电影"

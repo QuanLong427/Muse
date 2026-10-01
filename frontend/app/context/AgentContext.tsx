@@ -1,6 +1,6 @@
 "use client";
 
-import type { AgentState, ChatMessage, Track } from "@/app/lib/types";
+import type { AgentState, ChatMessage, Track, TrackCardData } from "@/app/lib/types";
 import { useMode } from "@/app/context/ModeContext";
 import { usePlayer } from "@/app/context/PlayerContext";
 import { useSSE } from "@/app/hooks/useSSE";
@@ -18,19 +18,6 @@ import {
 
 export type ConvertTrack = { bvid: string; title?: string; author?: string };
 
-function parseTracksFromMessage(content: string): Track[] {
-  const match = content.match(/```tracks\s*\n([\s\S]*?)```/);
-  if (!match) return [];
-  try {
-    const parsed = JSON.parse(match[1].trim());
-    const arr = Array.isArray(parsed) ? parsed : parsed?.tracks;
-    if (Array.isArray(arr)) {
-      return arr.filter((t: Record<string, unknown>) => t && t.id && t.title);
-    }
-  } catch { /* not valid JSON */ }
-  return [];
-}
-
 type AgentCtxValue = AgentState & {
   sendMessage: (text: string) => Promise<void>;
   clearMessages: () => void;
@@ -44,7 +31,11 @@ type AgentCtxValue = AgentState & {
   scenarios: string[];
   addScenario: (name: string) => Promise<void>;
   deleteScenario: (name: string) => Promise<void>;
-  onConvertedTracksRef: React.RefObject<((tracks: Track[]) => void) | null>;
+  voiceOutputEnabled: boolean;
+  voiceSpeaking: boolean;
+  voiceOutputError: string;
+  toggleVoiceOutput: () => void;
+  stopVoiceOutput: () => void;
 };
 
 const AgentContext = createContext<AgentCtxValue | null>(null);
@@ -59,8 +50,8 @@ function appendFromSdkPayload(
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
   setSessionId: React.Dispatch<React.SetStateAction<string | null>>,
   streamingIdRef: React.MutableRefObject<string | null>
-) {
-  if (!data || typeof data !== "object") return;
+): string | null {
+  if (!data || typeof data !== "object") return null;
   const d = data as Record<string, unknown>;
 
   const sid = d.session_id;
@@ -74,7 +65,7 @@ function appendFromSdkPayload(
   if (t === "assistant") {
     const message = d.message as Record<string, unknown> | undefined;
     const content = message?.content;
-    if (!Array.isArray(content)) return;
+    if (!Array.isArray(content)) return null;
     const blocks = content as Array<Record<string, unknown>>;
     for (const block of blocks) {
       if (block.type === "text") {
@@ -124,7 +115,7 @@ function appendFromSdkPayload(
         }
       }
     }
-    return;
+    return null;
   }
 
   if (t === "tool_call") {
@@ -149,7 +140,23 @@ function appendFromSdkPayload(
         toolName: name,
       },
     ]);
-    return;
+    return null;
+  }
+
+  if (t === "track_cards") {
+    const tracks = d.tracks;
+    if (!Array.isArray(tracks) || tracks.length === 0) return null;
+    setMessages((m) => [
+      ...m,
+      {
+        id: newId(),
+        role: "agent" as const,
+        content: "",
+        timestamp: ts,
+        trackCards: tracks as TrackCardData[],
+      },
+    ]);
+    return null;
   }
 
   if (t === "result" && d.subtype === "success" && typeof d.result === "string") {
@@ -172,12 +179,25 @@ function appendFromSdkPayload(
         ]);
       }
     }
-    return;
+    return text || null;
   }
 
   if (t === "done") {
     streamingIdRef.current = null;
   }
+  return null;
+}
+
+function toSpeechText(content: string): string {
+  return content
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!?(?:\[)([^\]]+)(?:\])\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 2000);
 }
 
 export function AgentProvider({
@@ -189,10 +209,6 @@ export function AgentProvider({
 }) {
   const { mode } = useMode();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const messagesRef = useRef(messages);
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const streamingIdRef = useRef<string | null>(null);
@@ -202,11 +218,16 @@ export function AgentProvider({
   const [convertQueue, setConvertQueue] = useState<ConvertTrack[]>([]);
   const [convertingSet, setConvertingSet] = useState<Set<string>>(new Set());
   const [convertedSet, setConvertedSet] = useState<Set<string>>(new Set());
-  const onConvertedTracksRef = useRef<((tracks: Track[]) => void) | null>(null);
+  const [voiceOutputEnabled, setVoiceOutputEnabled] = useState(false);
+  const [voiceSpeaking, setVoiceSpeaking] = useState(false);
+  const [voiceOutputError, setVoiceOutputError] = useState("");
+  const voiceOutputEnabledRef = useRef(false);
+  const speechAudioRef = useRef<HTMLAudioElement | null>(null);
+  const speechAbortRef = useRef<AbortController | null>(null);
+  const speechObjectUrlRef = useRef<string | null>(null);
 
   const {
     state: playerState,
-    addTracks,
     play,
     pause,
     next: playNext,
@@ -214,18 +235,97 @@ export function AgentProvider({
     stop,
     seek,
     setVolume,
+    playTrack,
   } = usePlayer();
   const playerStateRef = useRef(playerState);
   useEffect(() => {
     playerStateRef.current = playerState;
   }, [playerState]);
 
-  // Register auto-add callback from PlayerContext
   useEffect(() => {
-    onConvertedTracksRef.current = (tracks: Track[]) => {
-      addTracks(tracks);
-    };
-  }, [addTracks]);
+    const enabled = window.localStorage.getItem("musicer.voice-output") === "true";
+    voiceOutputEnabledRef.current = enabled;
+    setVoiceOutputEnabled(enabled);
+  }, []);
+
+  const stopVoiceOutput = useCallback(() => {
+    speechAbortRef.current?.abort();
+    speechAbortRef.current = null;
+    const audio = speechAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute("src");
+    }
+    speechAudioRef.current = null;
+    if (speechObjectUrlRef.current) URL.revokeObjectURL(speechObjectUrlRef.current);
+    speechObjectUrlRef.current = null;
+    setVoiceSpeaking(false);
+  }, []);
+
+  const speak = useCallback(async (content: string) => {
+    if (!voiceOutputEnabledRef.current) return;
+    const text = toSpeechText(content);
+    if (!text) return;
+
+    stopVoiceOutput();
+    const controller = new AbortController();
+    speechAbortRef.current = controller;
+    setVoiceSpeaking(true);
+    setVoiceOutputError("");
+    try {
+      const response = await fetch(apiUrl("/api/voice/synthesize"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        let detail = response.statusText || `HTTP ${response.status}`;
+        try {
+          const payload = (await response.json()) as Record<string, unknown>;
+          if (typeof payload.detail === "string") detail = payload.detail;
+        } catch {
+          // Keep the HTTP status fallback.
+        }
+        throw new Error(detail);
+      }
+      const blob = await response.blob();
+      if (controller.signal.aborted) return;
+      const objectUrl = URL.createObjectURL(blob);
+      speechObjectUrlRef.current = objectUrl;
+      const audio = new Audio(objectUrl);
+      speechAudioRef.current = audio;
+      const finish = () => {
+        if (speechAudioRef.current === audio) {
+          speechAudioRef.current = null;
+          setVoiceSpeaking(false);
+        }
+        URL.revokeObjectURL(objectUrl);
+        if (speechObjectUrlRef.current === objectUrl) speechObjectUrlRef.current = null;
+      };
+      audio.addEventListener("ended", finish, { once: true });
+      audio.addEventListener("error", finish, { once: true });
+      await audio.play();
+    } catch (reason) {
+      if (!controller.signal.aborted) {
+        setVoiceOutputError(reason instanceof Error ? reason.message : "语音播报失败");
+      }
+      stopVoiceOutput();
+    } finally {
+      if (speechAbortRef.current === controller) speechAbortRef.current = null;
+    }
+  }, [stopVoiceOutput]);
+
+  const toggleVoiceOutput = useCallback(() => {
+    const next = !voiceOutputEnabledRef.current;
+    voiceOutputEnabledRef.current = next;
+    setVoiceOutputEnabled(next);
+    window.localStorage.setItem("musicer.voice-output", String(next));
+    setVoiceOutputError("");
+    if (!next) stopVoiceOutput();
+  }, [stopVoiceOutput]);
+
+  useEffect(() => stopVoiceOutput, [stopVoiceOutput]);
 
   useEffect(() => {
     const getOrCreateId = (key: string, legacyDefault?: string) => {
@@ -253,6 +353,20 @@ export function AgentProvider({
       case "play":
         void play();
         break;
+      case "play_track": {
+        const track = actionData.track;
+        if (!track || typeof track !== "object") return false;
+        const candidate = track as Partial<Track>;
+        if (
+          typeof candidate.id !== "string" ||
+          typeof candidate.title !== "string" ||
+          typeof candidate.url !== "string"
+        ) {
+          return false;
+        }
+        playTrack(candidate as Track);
+        break;
+      }
       case "pause":
         pause();
         break;
@@ -275,7 +389,7 @@ export function AgentProvider({
         return false;
     }
     return true;
-  }, [pause, play, playNext, playPrevious, seek, setVolume, stop]);
+  }, [pause, play, playNext, playPrevious, playTrack, seek, setVolume, stop]);
 
   const { send, loading, cancel: sseCancel } = useSSE({
     url: apiUrl(chatApiPath),
@@ -291,7 +405,33 @@ export function AgentProvider({
       }
       if (msg.event === "output") {
         if (executePlayerAction(msg.data)) return;
-        appendFromSdkPayload(msg.data, setMessages, setSessionId, streamingIdRef);
+        if (msg.data && typeof msg.data === "object") {
+          const payload = msg.data as Record<string, unknown>;
+          if (payload.type === "track_cards" && payload.origin_tool === "convert_video") {
+            const cards = Array.isArray(payload.tracks) ? payload.tracks : [];
+            const completedBvids = cards
+              .map((card) =>
+                card && typeof card === "object"
+                  ? (card as Record<string, unknown>).bvid
+                  : null
+              )
+              .filter((bvid): bvid is string => typeof bvid === "string" && Boolean(bvid));
+            if (completedBvids.length) {
+              setConvertedSet((previous) => {
+                const next = new Set(previous);
+                completedBvids.forEach((bvid) => next.add(bvid));
+                return next;
+              });
+            }
+          }
+        }
+        const finalText = appendFromSdkPayload(
+          msg.data,
+          setMessages,
+          setSessionId,
+          streamingIdRef
+        );
+        if (finalText) void speak(finalText);
         return;
       }
       if (msg.event === "error") {
@@ -333,11 +473,18 @@ export function AgentProvider({
       artist: t.author || "",
       bvid: t.bvid,
     }));
-    const msg = `请将以下B站视频转为音频并加入播放列表:\n${JSON.stringify(items)}`;
+    const msg = `请将以下B站视频转为音频并保存到本地曲库，不要自动加入播放队列:\n${JSON.stringify(items)}`;
     send(msg, {
       user_id: userId ?? "local",
       session_id: sessionId ?? "default",
       scenario: currentScenario,
+      selected_tracks: items.map((item) => ({
+        bvid: item.bvid,
+        title: item.title,
+        author: item.artist,
+        duration: "",
+        url: item.url,
+      })),
     });
   }, [send, userId, sessionId, currentScenario]);
 
@@ -368,37 +515,12 @@ export function AgentProvider({
   }, [sseCancel]);
 
   const prevLoadingRef = useRef(loading);
-  const prevConvertingRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const wasLoading = prevLoadingRef.current;
     prevLoadingRef.current = loading;
 
     if (wasLoading && !loading) {
-      const hadConverting = prevConvertingRef.current.size > 0;
-      setConvertingSet((prev) => {
-        if (prev.size > 0) {
-          setConvertedSet((done) => {
-            const next = new Set(done);
-            for (const bv of prev) next.add(bv);
-            return next;
-          });
-        }
-        prevConvertingRef.current = prev;
-        return new Set();
-      });
-
-      // Auto-add converted tracks to playlist
-      if (hadConverting && onConvertedTracksRef.current) {
-        const lastAgentMsg = [...messagesRef.current]
-          .reverse()
-          .find((m) => m.role === "agent");
-        if (lastAgentMsg) {
-          const tracks = parseTracksFromMessage(lastAgentMsg.content);
-          if (tracks.length > 0) {
-            onConvertedTracksRef.current(tracks);
-          }
-        }
-      }
+      setConvertingSet(() => new Set());
 
       if (convertQueueRef.current.length > 0) {
         setTimeout(() => flush(), 50);
@@ -417,16 +539,26 @@ export function AgentProvider({
         });
         const res = await fetch(apiUrl(`/api/history?${params.toString()}`));
         if (res.ok) {
-          const data = await res.json();
-          if (data.history && Array.isArray(data.history)) {
+            const data = await res.json();
+            if (data.history && Array.isArray(data.history)) {
             const clearOffset = data.clear_offset ?? 0;
             const filtered = data.history.slice(clearOffset);
-            const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => ({
-              id: newId(),
-              role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
-              content: record.content as string,
-              timestamp: new Date(record.timestamp as string).getTime() || Date.now(),
-            }));
+            const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => {
+              const metadata =
+                record.metadata && typeof record.metadata === "object"
+                  ? (record.metadata as Record<string, unknown>)
+                  : {};
+              const cards = Array.isArray(metadata.track_cards)
+                ? (metadata.track_cards as TrackCardData[])
+                : undefined;
+              return {
+                id: newId(),
+                role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
+                content: record.content as string,
+                timestamp: new Date(record.timestamp as string).getTime() || Date.now(),
+                ...(cards?.length ? { trackCards: cards } : {}),
+              };
+            });
             setMessages(historyMessages);
           }
         }
@@ -582,9 +714,13 @@ export function AgentProvider({
       scenarios,
       addScenario,
       deleteScenario,
-      onConvertedTracksRef,
+      voiceOutputEnabled,
+      voiceSpeaking,
+      voiceOutputError,
+      toggleVoiceOutput,
+      stopVoiceOutput,
     }),
-    [messages, loading, sessionId, sendMessage, clearMessages, queueConvert, cancel, convertQueue, convertingSet, convertedSet, currentScenario, scenarios, addScenario, deleteScenario]
+    [messages, loading, sessionId, sendMessage, clearMessages, queueConvert, cancel, convertQueue, convertingSet, convertedSet, currentScenario, scenarios, addScenario, deleteScenario, voiceOutputEnabled, voiceSpeaking, voiceOutputError, toggleVoiceOutput, stopVoiceOutput]
   );
 
   return (

@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import bili, chat, config, dream, history, memory, playlist, scenario, search, tracks, wiki
+from routers import bili, chat, config, dream, history, memory, playlist, scenario, search, tracks, voice, wiki
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ app.include_router(playlist.router)
 app.include_router(scenario.router)
 app.include_router(search.router)
 app.include_router(tracks.router)
+app.include_router(voice.router)
 app.include_router(wiki.router)
 
 

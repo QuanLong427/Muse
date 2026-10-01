@@ -77,3 +77,28 @@ def test_config_update_does_not_persist_masked_api_key(monkeypatch):
         "OPENAI_BASE_URL": "https://example.com/compatible-mode/v1",
         "MODEL_NAME": "qwen3.5-flash",
     }
+
+
+def test_voice_transcribe_rejects_non_audio_body():
+    response = client.post(
+        "/api/voice/transcribe",
+        content=b"not audio",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert response.status_code == 415
+
+
+def test_voice_transcribe_returns_text(monkeypatch):
+    async def fake_transcribe(audio, media_type):
+        assert audio == b"recording"
+        assert media_type == "audio/webm"
+        return "下一首"
+
+    monkeypatch.setattr("routers.voice.transcribe_audio", fake_transcribe)
+    response = client.post(
+        "/api/voice/transcribe",
+        content=b"recording",
+        headers={"Content-Type": "audio/webm;codecs=opus"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"text": "下一首"}

@@ -58,8 +58,8 @@ def parse_name(name: str) -> dict[str, str | None]:
     return {"title": name, "author": "", "date": "", "bvid": bvid or None}
 
 
-def scan_tracks() -> list[Track]:
-    music_dir = settings.MUSIC_DIR
+def scan_tracks(music_dir: str | None = None) -> list[Track]:
+    music_dir = music_dir or settings.MUSIC_DIR
     tracks: list[Track] = []
 
     try:
@@ -111,6 +111,11 @@ def find_track_by_bvid(bvid: str) -> Track | None:
         if track.bvid == bvid:
             return track
     return None
+
+
+def find_track_by_id(track_id: str) -> Track | None:
+    """Resolve an exact local track identifier without fuzzy title matching."""
+    return next((track for track in scan_tracks() if track.id == track_id), None)
 
 
 def search_tracks(query: str, limit: int = 20) -> list[Track]:

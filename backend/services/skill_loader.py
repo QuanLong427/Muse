@@ -110,3 +110,45 @@ def load_skill(skill_name: str, skills_root: Optional[Path] = None) -> Tuple[str
     if m:
         body = full[m.end():].strip()
     return full, body
+
+
+def find_skill_directory(
+    skill_name: str, skills_root: Optional[Path] = None
+) -> Optional[Path]:
+    """Resolve a discovered Skill directory by frontmatter name."""
+    for root in _skill_roots(skills_root):
+        if not root.is_dir():
+            continue
+        for skill_dir in root.iterdir():
+            skill_md = skill_dir / SKILL_FILENAME
+            if not skill_dir.is_dir() or not skill_md.is_file():
+                continue
+            try:
+                raw = skill_md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _parse_frontmatter(raw).get("name") == skill_name:
+                return skill_dir.resolve()
+    return None
+
+
+def load_skill_resource(
+    skill_name: str,
+    resource_path: str,
+    skills_root: Optional[Path] = None,
+) -> str:
+    """Read a text resource confined to one Skill's references directory."""
+    skill_dir = find_skill_directory(skill_name, skills_root)
+    if skill_dir is None:
+        raise ValueError("unknown_skill")
+    references_root = (skill_dir / "references").resolve()
+    candidate = (references_root / resource_path).resolve()
+    try:
+        candidate.relative_to(references_root)
+    except ValueError as exc:
+        raise ValueError("invalid_skill_resource") from exc
+    if candidate.suffix.lower() not in {".md", ".txt", ".json", ".yaml", ".yml"}:
+        raise ValueError("unsupported_skill_resource")
+    if not candidate.is_file():
+        raise ValueError("skill_resource_not_found")
+    return candidate.read_text(encoding="utf-8", errors="replace")

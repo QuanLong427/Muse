@@ -1,13 +1,11 @@
+import asyncio
 import json
-import os
-import shutil
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from config import PROJECT_ROOT
 from services.ai_agent import chat_stream
 from services.memory_manager import reset_memory
 from services.memory_store import (
@@ -43,6 +41,7 @@ class ChatRequest(BaseModel):
     player_state: dict[str, Any] | None = None
     user_id: str = DEFAULT_USER_ID
     session_id: str | None = None
+    selected_tracks: list[dict[str, Any]] | None = None
 
 
 @router.post("/api/chat")
@@ -60,15 +59,18 @@ async def chat(req: ChatRequest):
         return _sse_response("当前会话屏幕已清空，长期记忆未删除", session_id=session_id)
 
     if msg == "/reset-wiki":
-        wiki_dir = os.path.join(PROJECT_ROOT, "LLM-Wiki")
         try:
-            if os.path.exists(wiki_dir):
-                shutil.rmtree(wiki_dir)
-            from services.wiki_manager import init_wiki
-            init_wiki()
-            return _sse_response("LLM-Wiki 已重置并重新初始化完成")
+            from services.wiki_manager import reset_wiki
+
+            result = await asyncio.to_thread(reset_wiki)
+            return _sse_response(
+                "LLM-Wiki 已安全重置；"
+                f"保留本地歌曲 {result['preserved_local_tracks']} 首；"
+                f"恢复清单：{result['recovery_manifest']}",
+                session_id=session_id,
+            )
         except Exception as e:
-            return _sse_response(f"重置失败: {e}")
+            return _sse_response(f"重置失败，本地歌曲未删除: {e}", session_id=session_id)
 
     if msg == "/reset-memory":
         try:
@@ -85,6 +87,7 @@ async def chat(req: ChatRequest):
             player_state=req.player_state,
             user_id=user_id,
             session_id=session_id,
+            selected_tracks=req.selected_tracks or [],
         ):
             yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
 

@@ -1,23 +1,59 @@
 services:
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     env_file:
-      - backend/.env
-      - backend/.env.local
+      - path: backend/.env
+        required: false
+      - path: backend/.env.local
+        required: false
     environment:
-      - MUSIC_DIR=/music
+      MUSIC_DIR: /music
+      WIKI_DIR: /app/LLM-Wiki
+      BILIBILI_COOKIES_FILE: /run/secrets/musicer/bilibili-cookies.txt
+      BACKEND_PORT: 8000
     volumes:
-      - ${MUSIC_DIR:-~/Documents/bili}:/music
+      - type: bind
+        source: ${MUSIC_PATH:-./Documents/bili}
+        target: /music
+      - type: bind
+        source: ./memory/data
+        target: /app/memory/data
+      - type: bind
+        source: ./LLM-Wiki
+        target: /app/LLM-Wiki
+      - type: bind
+        source: ./db
+        target: /app/db
+      - type: bind
+        source: ./secrets
+        target: /run/secrets/musicer
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3002"
     environment:
-      - BACKEND_URL=http://backend:8000
+      BACKEND_URL: http://backend:8000
+      MUSIC_DIR: /music
+    volumes:
+      - type: bind
+        source: ${MUSIC_PATH:-./Documents/bili}
+        target: /music
+        read_only: true
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped

@@ -1,4 +1,4 @@
-"""Compatibility facade for the v2 memory system.
+"""Compatibility facade for the v2.1 memory system.
 
 SQLite is the source of truth for conversations and structured memories. The
 Markdown profile remains an inspectable compatibility projection so existing
@@ -27,6 +27,7 @@ from services.memory_store import (
     list_memory_items,
     mark_messages_processed,
     reset_user_memory,
+    search_memory_episodes,
     set_meta,
 )
 
@@ -138,6 +139,82 @@ def get_structured_memory_context(
         f"(置信度 {float(item['confidence']):.2f})"
         for item in items
     )
+
+
+_EXPLICIT_EPISODE_RECALL = re.compile(
+    r"上次|之前|以前|刚才|前面|还记得|像上回|继续上次|历史"
+)
+_EPISODE_WORTHY_INTENT = re.compile(
+    r"歌单|推荐|找歌|搜索|查找|下载|版本|翻唱|原唱|live|remix|"
+    r"偏好|喜欢|不喜欢|类似|场景|跑步|通勤|睡觉|学习|工作|失败|错误",
+    re.IGNORECASE,
+)
+
+
+def get_relevant_episode_context(
+    user_id: str,
+    scenario: str,
+    query: str,
+    limit: int = 3,
+) -> dict[str, Any]:
+    """Retrieve every turn, but inject only when episodic context can help.
+
+    Simple transport controls such as "下一首" do not benefit from a prior
+    episode.  Personalized, multi-step, corrective and explicit-history
+    requests do.  This keeps implicit recall available without filling every
+    prompt with unrelated history.
+    """
+    explicit_recall = bool(_EXPLICIT_EPISODE_RECALL.search(query))
+    retrieval_worthy = explicit_recall or bool(_EPISODE_WORTHY_INTENT.search(query))
+    episodes = search_memory_episodes(
+        query,
+        user_id=user_id,
+        scenario=scenario or "默认",
+        limit=limit,
+        min_score=0.18 if explicit_recall else 0.22,
+    )
+    if not retrieval_worthy:
+        return {"text": "", "episode_ids": [], "episodes": []}
+
+    threshold = 0.2 if explicit_recall else 0.3
+    selected = [
+        episode
+        for episode in episodes
+        if float(episode.get("retrieval_score", 0.0)) >= threshold
+    ][:limit]
+    if not selected:
+        return {"text": "", "episode_ids": [], "episodes": []}
+
+    lines = [
+        "## 与当前请求相关的过往事件",
+        "以下是可追溯的历史执行记录，仅供参考；如与本轮要求冲突，以本轮为准。",
+    ]
+    for episode in selected:
+        created = str(episode.get("created_at", ""))[:10]
+        parts = [
+            f"目标：{episode['goal'][:300]}",
+            f"动作：{episode['action_summary'][:300]}",
+            f"结果：{episode['result_status']}，{episode['result_summary'][:500]}",
+        ]
+        constraints = episode.get("constraints") or []
+        if constraints:
+            parts.append("约束：" + "；".join(map(str, constraints[:5])))
+        entities = episode.get("entity_refs") or {}
+        if entities:
+            entity_text = "；".join(
+                f"{key}={','.join(map(str, values[:5]))}"
+                for key, values in list(entities.items())[:5]
+            )
+            parts.append("实体：" + entity_text)
+        lines.append(
+            f"- [{created}][{episode['scenario']}][{episode['episode_type']}] "
+            + "；".join(parts)
+        )
+    return {
+        "text": "\n".join(lines),
+        "episode_ids": [episode["id"] for episode in selected],
+        "episodes": selected,
+    }
 
 
 def remove_profile_scenario(

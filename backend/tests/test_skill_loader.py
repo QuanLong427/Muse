@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from pathlib import Path
 
-from services.skill_loader import discover_skills, load_skill
+from services.skill_loader import discover_skills, load_skill, load_skill_resource
 
 
 def test_discover_skills():
@@ -57,6 +57,18 @@ def test_load_llm_wiki_skill():
     full, body = load_skill("llm-wiki")
     assert "name: llm-wiki" in full
     assert "backend/services/wiki_ingest.py" in body
+
+
+def test_load_skill_resource_is_confined_to_references():
+    content = load_skill_resource("llm-wiki", "workflows.md")
+
+    assert "Wiki" in content
+    try:
+        load_skill_resource("llm-wiki", "../SKILL.md")
+    except ValueError as exc:
+        assert str(exc) == "invalid_skill_resource"
+    else:
+        raise AssertionError("resource traversal should be rejected")
 
 
 def test_discover_explicit_root_only(tmp_path: Path):

@@ -7,6 +7,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
+import type { VoiceInputStatus } from "@/app/hooks/useVoiceRecorder";
 
 const SLASH_COMMANDS = [
   { command: "/reset-wiki", label: "重置知识库" },
@@ -18,12 +19,18 @@ type Props = {
   onSubmit: (text: string) => void;
   disabled?: boolean;
   placeholder?: string;
+  voice?: {
+    supported: boolean;
+    status: VoiceInputStatus;
+    toggle: () => void;
+  };
 };
 
 export function CommandInput({
   onSubmit,
   disabled = false,
   placeholder = "Hi, 告诉我你想听什么…",
+  voice,
 }: Props) {
   const [value, setValue] = useState("");
   const [cursorLeft, setCursorLeft] = useState(0);
@@ -91,6 +98,16 @@ export function CommandInput({
     requestAnimationFrame(syncCursor);
   };
 
+  const voiceBusy = voice?.status === "transcribing";
+  const recording = voice?.status === "recording";
+  const voiceDisabled =
+    !voice?.supported || voiceBusy || (disabled && !recording);
+  const resolvedPlaceholder = recording
+    ? "正在录音，再次点击麦克风结束…"
+    : voiceBusy
+      ? "正在识别语音…"
+      : placeholder;
+
   return (
     <div className="relative w-full rounded-xl border border-[var(--glass-border)] bg-[rgba(255,255,255,0.04)] transition-all duration-200 focus-within:border-[rgba(129,140,248,0.3)] focus-within:bg-[rgba(255,255,255,0.06)]">
       {showMenu && (
@@ -121,7 +138,7 @@ export function CommandInput({
             type="text"
             disabled={disabled}
             value={value}
-            placeholder={placeholder}
+            placeholder={resolvedPlaceholder}
             onChange={(e) => {
               setValue(e.target.value);
               requestAnimationFrame(syncCursor);
@@ -154,6 +171,40 @@ export function CommandInput({
             }}
           />
         </div>
+        {voice && (
+          <button
+            type="button"
+            aria-label={recording ? "结束录音" : "开始语音输入"}
+            aria-pressed={recording}
+            title={
+              !voice.supported
+                ? "当前浏览器不支持录音"
+                : voiceBusy
+                  ? "正在识别语音"
+                  : recording
+                    ? "结束录音"
+                    : "语音输入"
+            }
+            disabled={voiceDisabled}
+            onClick={voice.toggle}
+            className={`mr-2 mt-1.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed disabled:opacity-35 ${
+              recording
+                ? "animate-pulse border-red-400/60 bg-red-400/15 text-red-300"
+                : "border-[var(--glass-border)] bg-white/5 text-[color:var(--color-on-surface-muted)] hover:border-[rgba(129,140,248,0.45)] hover:text-[color:var(--color-primary)]"
+            }`}
+          >
+            {voiceBusy ? (
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            ) : recording ? (
+              <span className="h-3 w-3 rounded-sm bg-current" />
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+                <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 1 0 6 0V6a3 3 0 0 0-3-3Z" stroke="currentColor" strokeWidth="1.8" />
+                <path d="M6.5 11.5V12a5.5 5.5 0 0 0 11 0v-.5M12 17.5V21M9.5 21h5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </svg>
+            )}
+          </button>
+        )}
       </div>
     </div>
   );

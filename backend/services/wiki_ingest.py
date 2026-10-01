@@ -108,6 +108,8 @@ def _probe_duration(path: str) -> Optional[float]:
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=True,
         )
@@ -209,6 +211,38 @@ external_source_count: {len(external_sources)}
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
     return filepath
+
+
+def register_source_asset(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
+    """Register verified source identity without running LLM enrichment.
+
+    This is used by the download lifecycle.  It intentionally writes only a
+    raw source asset; graph entities remain pending until the explicit
+    llm-wiki ingest workflow runs.
+    """
+    from services.wiki_manager import get_wiki_status, init_wiki
+
+    target = str(Path(wiki_dir or settings.WIKI_DIR).resolve())
+    if not get_wiki_status(target).get("initialized"):
+        init_wiki(target)
+    bvid = str(song_meta.get("bvid") or "").strip()
+    existing_path = Path(target) / "raw" / "songs" / f"{bvid}.md" if bvid else None
+    if existing_path is not None and existing_path.is_file():
+        return {
+            "status": "source_already_registered",
+            "source_path": existing_path.relative_to(Path(target)).as_posix(),
+            "bvid": bvid,
+            "local_file_path": song_meta.get("local_file_path") or "",
+            "enrichment_status": "unchanged",
+        }
+    raw_path = _save_raw_material(song_meta, target)
+    return {
+        "status": "source_registered",
+        "source_path": Path(raw_path).resolve().relative_to(Path(target)).as_posix(),
+        "bvid": song_meta.get("bvid") or "",
+        "local_file_path": song_meta.get("local_file_path") or "",
+        "enrichment_status": "pending",
+    }
 
 
 def _check_cache(raw_path: str, wiki_dir: str) -> bool:
@@ -1040,52 +1074,6 @@ def ingest_song(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
 
     orphan_pages = _process_orphaned_connections(connections, analysis, wiki_dir, alias_index)
     all_entity_pages = artist_pages + album_pages + genre_pages + orphan_pages
-
-    # Step 7.5: Rename audio file using LLM-analyzed artist names
-    audio_path = song_meta.get("local_file_path", "")
-    if audio_path and os.path.exists(audio_path):
-        artist_names = [
-            resolve_name(a["name"], alias_index)
-            for a in analysis.get("artists", [])
-        ]
-        # Filter out Unknown and empty, take first 3
-        artist_names = [a for a in artist_names if a and a != "Unknown"][:3]
-        if artist_names:
-            artist_part = "+".join(artist_names)
-            # Extract title and bvid from original filename
-            orig_basename = os.path.basename(audio_path)
-            # Parse: {old_artist}-{title}-{bvid}.mp3
-            base = orig_basename[:-4] if orig_basename.endswith(".mp3") else orig_basename
-            # Extract bvid from end
-            bvid_match = re.search(r"[-_ ]*(BV[A-Za-z0-9]+)$", base)
-            bvid_str = bvid_match.group(1) if bvid_match else ""
-            if bvid_match:
-                base = base[: -len(bvid_match.group(0))].rstrip("-_ ")
-            # Split by dash: old_artist-title
-            parts = base.split("-", 1)
-            title_part = (parts[1] if len(parts) >= 2 else parts[0]).strip("-_ ")
-            artist_part = _safe_entity_name(artist_part)
-            title_part = _safe_entity_name(title_part)
-            # Build new filename
-            new_basename = f"{artist_part}-{title_part}-{bvid_str}.mp3" if bvid_str else f"{artist_part}-{title_part}.mp3"
-            new_path = os.path.join(os.path.dirname(audio_path), new_basename)
-            try:
-                if os.path.normcase(audio_path) != os.path.normcase(new_path):
-                    if os.path.exists(new_path):
-                        raise FileExistsError(new_path)
-                    old_relative_path = _relative_audio_path(audio_path)
-                    os.rename(audio_path, new_path)
-                    new_relative_path = _relative_audio_path(new_path)
-                    with open(raw_path, "r", encoding="utf-8") as f:
-                        raw_content = f.read()
-                    raw_content = raw_content.replace(
-                        f"local_relative_path: {_yaml_value(old_relative_path)}",
-                        f"local_relative_path: {_yaml_value(new_relative_path)}",
-                    )
-                    with open(raw_path, "w", encoding="utf-8") as f:
-                        f.write(raw_content)
-            except OSError:
-                pass  # Skip rename on error
 
     # Step 8: Update index and log
     _update_index_and_log(song_meta, song_entity_path, all_entity_pages, wiki_dir)
