@@ -59,6 +59,11 @@ def _entity_refs(*values: Any) -> dict[str, list[str]]:
 def _classify_episode(user_message: str, tool_names: Iterable[str]) -> str:
     names = set(tool_names)
     text = user_message.lower()
+    if re.search(
+        r"你(?:可以|能|会)做(?:什么|哪些)|你有(?:什么|哪些)(?:功能|能力)|支持(?:什么|哪些)功能",
+        text,
+    ):
+        return "capability"
     if re.search(r"不是|不对|纠正|改成|记错|说错", text):
         return "correction"
     if names & {"convert_video", "download_music", "download_audio"} or "下载" in text:
@@ -142,6 +147,7 @@ def archive_turn_episode(
         "memory_management": 0.65,
         "playback_control": 0.3,
         "conversation": 0.2,
+        "capability": 0.1,
     }
     constraints = [
         match.group(0).strip()

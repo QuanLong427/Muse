@@ -1,7 +1,7 @@
 import os
 import sys
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -86,3 +86,30 @@ def test_allows_dispatch_wording_with_real_tool_message():
 
 def test_allows_ordinary_conversation():
     assert validate_final_response("当然可以，你想听什么风格？", [], TOOLS) is None
+
+
+def test_allows_capability_description_about_downloaded_tracks():
+    text = "我可以播放已下载的本地歌曲，也可以暂停、切换下一首。"
+
+    assert (
+        validate_final_response(
+            text,
+            [HumanMessage(content="你可以做哪些事情")],
+            TOOLS,
+        )
+        is None
+    )
+
+
+def test_still_rejects_actual_download_success_claim_without_tool():
+    violation = validate_final_response("《七里香》已经下载到本地。", [], TOOLS)
+
+    assert violation is not None
+    assert violation.code == "unobserved_action_claim"
+
+
+def test_still_rejects_actual_conversion_success_claim_without_tool():
+    violation = validate_final_response("《七里香》转换已完成。", [], TOOLS)
+
+    assert violation is not None
+    assert violation.code == "unobserved_action_claim"

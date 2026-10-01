@@ -1,13 +1,13 @@
 "use client";
 
 import type { CSSProperties } from "react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { Track, TrackCardData } from "@/app/lib/types";
 import type { ChatMessage as ChatMessageModel } from "@/app/lib/types";
 import { usePlayer } from "@/app/context/PlayerContext";
 import { useAgent } from "@/app/context/AgentContext";
 import { useDanmaku } from "@/app/context/DanmakuContext";
-import { useMemo } from "react";
+import { MarkdownContent } from "@/app/components/molecules/MarkdownContent";
 
 type Props = { message: ChatMessageModel };
 
@@ -83,7 +83,9 @@ function parseContent(content: string): ContentPart[] {
     if (tracks) {
       parts.push({ type: "tracks", tracks });
     } else {
-      parts.push({ type: "text", text: match[1] });
+      // Preserve non-Track code fences so the Markdown renderer can display
+      // ordinary JSON and code blocks correctly.
+      parts.push({ type: "text", text: match[0] });
     }
     last = match.index + match[0].length;
   }
@@ -355,15 +357,7 @@ export function ChatMessage({ message: m }: Props) {
           <div className={isOp ? "text-right" : "text-left"}>
             {parts.map((part, i) => {
               if (part.type === "tracks") return <TrackCards key={i} tracks={part.tracks} />;
-              return (
-                <pre
-                  key={i}
-                  className="m-0 whitespace-pre-wrap break-words text-sm leading-relaxed"
-                  style={{ fontFamily: "var(--font-body)", color: "var(--color-on-surface)" }}
-                >
-                  {part.text}
-                </pre>
-              );
+              return <MarkdownContent key={i} content={part.text} />;
             })}
           </div>
         ) : m.content ? (

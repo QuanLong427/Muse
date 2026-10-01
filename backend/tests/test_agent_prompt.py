@@ -12,6 +12,8 @@ def test_system_prompt_uses_react_principles_instead_of_fixed_tool_routes():
 
     assert "## ReAct 决策原则" in prompt
     assert "不预设固定工具顺序" in prompt
+    assert "最后一条用户消息视为当前目标" in prompt
+    assert "能力说明、使用帮助、概念解释" in prompt
     assert "## 可用 Agent Skills" in prompt
     assert "llm-wiki" in prompt
     assert "不得用代码块、命令文本或函数调用示例代替真实工具调用" in prompt

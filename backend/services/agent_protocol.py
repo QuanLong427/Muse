@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
 
 _FENCED_BLOCK = re.compile(r"```(?:bash|sh|shell|powershell|cmd)?\s*\n([\s\S]*?)```", re.I)
@@ -26,14 +26,48 @@ _DEFERRED_ENDINGS = (
     "我现在执行",
     "接下来我会调用",
 )
-_ACTION_CLAIMS = {
-    "播放": {"control_player", "play_track"},
-    "暂停": {"control_player"},
-    "下一首": {"control_player"},
-    "上一首": {"control_player"},
-    "下载": {"convert_video"},
-    "转换完成": {"convert_video"},
-}
+_ACTION_CLAIM_PATTERNS = (
+    (
+        "播放",
+        {"control_player", "play_track"},
+        re.compile(
+            r"(?:已经|已)(?:成功)?(?:为(?:您|你))?(?:成功)?(?:开始)?播放|播放成功"
+        ),
+    ),
+    (
+        "暂停",
+        {"control_player"},
+        re.compile(r"(?:已经|已)(?:成功)?(?:为(?:您|你))?(?:成功)?暂停|暂停成功"),
+    ),
+    (
+        "下一首",
+        {"control_player"},
+        re.compile(r"(?:已经|已)(?:成功)?切换到下一首|下一首(?:已经)?开始播放"),
+    ),
+    (
+        "上一首",
+        {"control_player"},
+        re.compile(r"(?:已经|已)(?:成功)?切换到上一首|上一首(?:已经)?开始播放"),
+    ),
+    (
+        "下载",
+        {"convert_video"},
+        re.compile(
+            r"(?:已经|已)(?:成功)?(?:将[^。！？；;\n]{0,40})?下载"
+            r"(?!的|歌曲|音乐|内容|文件|音频|曲目|资源)|下载成功"
+        ),
+    ),
+    (
+        "转换",
+        {"convert_video"},
+        re.compile(r"(?:已经|已)(?:成功)?转换|转换(?:已|已经)?(?:完成|成功)"),
+    ),
+)
+
+_CAPABILITY_PREFIX = re.compile(
+    r"(?:可以|能够|支持|用于|可用于|能帮(?:你|您)?|例如|包括)"
+    r"[^。！？；;\n]{0,40}$"
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +120,30 @@ def _has_dispatched_client_action(messages: Iterable[BaseMessage]) -> bool:
     return False
 
 
+def _is_capability_description(text: str, claim_start: int) -> bool:
+    """Distinguish capability examples from claims about completed actions."""
+    prefix = text[max(0, claim_start - 60) : claim_start]
+    return bool(_CAPABILITY_PREFIX.search(prefix))
+
+
+def _action_claims(text: str) -> list[tuple[str, set[str]]]:
+    claims: list[tuple[str, set[str]]] = []
+    for label, allowed_tools, pattern in _ACTION_CLAIM_PATTERNS:
+        for match in pattern.finditer(text):
+            if _is_capability_description(text, match.start()):
+                continue
+            claims.append((label, allowed_tools))
+            break
+    return claims
+
+
+def _latest_user_text(messages: Iterable[BaseMessage]) -> str:
+    for message in reversed(list(messages)):
+        if isinstance(message, HumanMessage):
+            return _message_text(message)
+    return ""
+
+
 def validate_final_response(
     text: str,
     messages: Iterable[BaseMessage],
@@ -123,38 +181,24 @@ def validate_final_response(
         )
 
     observed = observed_tool_names(messages)
-    definite_client_claims = (
-        "已播放",
-        "已经播放",
-        "播放成功",
-        "已暂停",
-        "已切换到下一首",
-        "已切换到上一首",
+    action_claims = _action_claims(stripped)
+    playback_claimed = any(
+        label in {"播放", "暂停", "下一首", "上一首"}
+        for label, _ in action_claims
     )
-    if _has_dispatched_client_action(messages) and any(
-        claim in stripped for claim in definite_client_claims
-    ):
+    if _has_dispatched_client_action(messages) and playback_claimed:
         return ProtocolViolation(
             "unconfirmed_client_action",
             "播放器工具只确认指令已下发，尚未收到浏览器执行 ACK；请表述为已发送相应指令",
         )
-    success_words = (
-        "已播放",
-        "已经播放",
-        "播放成功",
-        "已暂停",
-        "已下载",
-        "已经下载",
-        "下载成功",
-        "转换完成",
-    )
-    if any(word in stripped for word in success_words):
-        for claim, allowed_tools in _ACTION_CLAIMS.items():
-            if claim in stripped and not observed.intersection(allowed_tools):
-                return ProtocolViolation(
-                    "unobserved_action_claim",
-                    f"回答声称已{claim}，但本轮没有对应的真实工具结果",
-                )
+    for claim, allowed_tools in action_claims:
+        if not observed.intersection(allowed_tools):
+            user_text = _latest_user_text(messages)
+            context = f"（当前用户请求：{user_text[:80]}）" if user_text else ""
+            return ProtocolViolation(
+                "unobserved_action_claim",
+                f"回答声称已完成{claim}，但本轮没有对应的真实工具结果{context}",
+            )
     return None
 
 

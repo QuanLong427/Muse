@@ -627,7 +627,7 @@ def search_memory_episodes(
         rows = conn.execute(
             """
             SELECT * FROM memory_episodes
-            WHERE user_id = ?
+            WHERE user_id = ? AND result_status IN ('success', 'partial')
             ORDER BY created_at DESC LIMIT 300
             """,
             (user_id,),

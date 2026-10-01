@@ -166,6 +166,9 @@ def get_relevant_episode_context(
     """
     explicit_recall = bool(_EXPLICIT_EPISODE_RECALL.search(query))
     retrieval_worthy = explicit_recall or bool(_EPISODE_WORTHY_INTENT.search(query))
+    if not retrieval_worthy:
+        return {"text": "", "episode_ids": [], "episodes": []}
+
     episodes = search_memory_episodes(
         query,
         user_id=user_id,
@@ -173,9 +176,6 @@ def get_relevant_episode_context(
         limit=limit,
         min_score=0.18 if explicit_recall else 0.22,
     )
-    if not retrieval_worthy:
-        return {"text": "", "episode_ids": [], "episodes": []}
-
     threshold = 0.2 if explicit_recall else 0.3
     selected = [
         episode

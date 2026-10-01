@@ -31,9 +31,17 @@ export function useClock() {
     };
   };
 
-  const [state, setState] = useState(tick);
+  // The server and browser can have different clocks/time zones. Keep the
+  // hydration snapshot deterministic, then populate local time after mount.
+  const [state, setState] = useState({
+    time: "--:--",
+    seconds: "--",
+    day: "",
+    date: "",
+  });
 
   useEffect(() => {
+    setState(tick());
     const id = setInterval(() => setState(tick()), 1000);
     return () => clearInterval(id);
   }, []);

@@ -52,6 +52,8 @@ _BASE_PROMPT = """你是 Musicer 的 AI 音频助手。使用简洁、自然的�
 
 ## ReAct 决策原则
 - 每一步都根据用户意图和最新观察结果决定下一步，不预设固定工具顺序，也不执行与目标无关的调用。
+- 每轮只把最后一条用户消息视为当前目标；上一轮提到的歌曲、工具结果或助手提出的后续建议都不是待办，除非用户本轮明确引用或确认。
+- 对能力说明、使用帮助、概念解释等元问题，直接依据已注册能力和 Skill 元数据回答，不为举例而执行搜索或播放器动作。
 - 优先选择语义最匹配、作用范围最小的能力；结果已经足够时停止，不重复调用。
 - 当任务明显匹配某个专业 Skill 时，先加载其完整说明，再按照其中的工作流和边界执行。
 - 用户明确指定来源、范围或动作时尊重该约束；未指定且质量相当时，优先复用已有本地资源，避免不必要的网络请求、下载和转换。
@@ -1038,6 +1040,8 @@ async def chat_stream(
     try:
         final_text = ""
         current_model_text = ""
+        protocol_status = ""
+        protocol_issue = ""
         input_state: AgentState = {"messages": messages, "protocol_repairs": 0}
 
         async for event in agent.astream_events(input_state, version="v2", config={"recursion_limit": 50}):
@@ -1063,6 +1067,12 @@ async def chat_stream(
             elif kind == "on_chain_end":
                 output = event.get("data", {}).get("output")
                 if isinstance(output, dict):
+                    output_protocol_status = output.get("protocol_status")
+                    if isinstance(output_protocol_status, str) and output_protocol_status:
+                        protocol_status = output_protocol_status
+                    output_protocol_issue = output.get("protocol_issue")
+                    if isinstance(output_protocol_issue, str) and output_protocol_issue:
+                        protocol_issue = output_protocol_issue
                     output_messages = output.get("messages")
                     if isinstance(output_messages, list) and output_messages:
                         candidate = output_messages[-1]
@@ -1173,6 +1183,7 @@ async def chat_stream(
                     "type": "result",
                     "subtype": "success",
                     "result": final_text,
+                    "protocol_status": protocol_status or "valid",
                 },
             }
 
@@ -1188,7 +1199,11 @@ async def chat_stream(
                     scenario=scenario,
                     user_id=user_id,
                     session_id=session_id,
-                    metadata={"track_cards": presented_track_cards},
+                    metadata={
+                        "track_cards": presented_track_cards,
+                        "protocol_status": protocol_status or "valid",
+                        "protocol_issue": protocol_issue,
+                    },
                 )
                 episode_message_ids.append(agent_message_id)
             # Auto-trigger Dream if 5+ new records since last dream
@@ -1207,6 +1222,11 @@ async def chat_stream(
                 final_text=final_text,
                 player_state=player_state,
                 retrieved_episode_ids=retrieved_episode_ids,
+                error=(
+                    f"agent_protocol_blocked:{protocol_issue or 'unknown'}"
+                    if protocol_status == "blocked"
+                    else None
+                ),
             )
             episode_archived = True
         except Exception:
