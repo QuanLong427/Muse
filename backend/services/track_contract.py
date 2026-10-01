@@ -17,7 +17,8 @@ def local_track_card(track: Track) -> TrackCard:
         author=track.author,
         bvid=track.bvid,
         url=track.url,
-        allowed_actions=["play", "add_to_queue"],
+        download_status="downloaded",
+        allowed_actions=["play", "add_to_session"],
         local_track=track,
     )
 
@@ -36,6 +37,7 @@ def remote_track_card(video: dict[str, Any]) -> TrackCard | None:
         duration=str(video.get("duration") or ""),
         bvid=bvid,
         url=str(video.get("url") or f"https://www.bilibili.com/video/{bvid}"),
+        download_status="idle",
         allowed_actions=["download"],
     )
 

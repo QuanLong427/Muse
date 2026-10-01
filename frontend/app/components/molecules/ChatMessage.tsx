@@ -1,13 +1,15 @@
 "use client";
 
 import type { CSSProperties } from "react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Track, TrackCardData } from "@/app/lib/types";
 import type { ChatMessage as ChatMessageModel } from "@/app/lib/types";
 import { usePlayer } from "@/app/context/PlayerContext";
 import { useAgent } from "@/app/context/AgentContext";
 import { useDanmaku } from "@/app/context/DanmakuContext";
+import { usePlaylists } from "@/app/context/PlaylistContext";
 import { MarkdownContent } from "@/app/components/molecules/MarkdownContent";
+import { apiUrl } from "@/app/lib/api";
 
 type Props = { message: ChatMessageModel };
 
@@ -111,45 +113,35 @@ function parseContent(content: string): ContentPart[] {
 
 type TrackExt = Track & { bvid?: string; duration?: string };
 
+const LOCAL_TRACK_ID_RE = /(?:^|[/\\])[^/\\]+\.(?:mp3|flac|wav|m4a|aac|ogg|opus)$/i;
+
 function legacyTrackCard(track: TrackExt): TrackCardData {
-  const local = Boolean(track.filename);
+  const completeLocal = Boolean(track.filename && track.url);
+  const localHint = completeLocal || LOCAL_TRACK_ID_RE.test(track.id);
   return {
-    track_id: local ? track.id : `bilibili:${track.bvid || track.id}`,
-    source_type: local ? "local" : "bilibili",
-    availability: local ? "local" : "remote",
+    track_id: localHint ? track.id : `bilibili:${track.bvid || track.id}`,
+    source_type: localHint ? "local" : "bilibili",
+    availability: completeLocal ? "local" : localHint ? "failed" : "remote",
     title: track.title,
     author: track.author,
     duration: track.duration,
     bvid: track.bvid,
     url: track.url,
-    download_status: "idle",
-    allowed_actions: local ? ["play", "add_to_queue"] : ["download"],
-    local_track: local ? track : null,
+    download_status: completeLocal ? "downloaded" : "idle",
+    allowed_actions: completeLocal ? ["play", "add_to_session"] : localHint ? [] : ["download"],
+    local_track: completeLocal ? track : null,
   };
 }
 
-type ButtonState = "add" | "adding" | "added" | "downloaded";
-
-function getButtonState(
-  track: TrackExt,
-  inPlaylist: Set<string>,
-  convertingSet: Set<string>,
-  convertedSet: Set<string>,
-): ButtonState {
-  if (inPlaylist.has(track.id) || (track.bvid && inPlaylist.has(track.bvid))) return "added";
-  if (track.bvid && convertingSet.has(track.bvid)) return "adding";
-  if (track.bvid && convertedSet.has(track.bvid)) return "downloaded";
-  return "add";
-}
-
 function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardData[] }) {
-  const { state, addTracks, playTrack } = usePlayer();
+  const { state, addTracks, playTrack, play } = usePlayer();
   const { queueConvert, convertingSet, convertedSet } = useAgent();
   const { fetchDanmaku } = useDanmaku();
-  const inPlaylist = new Set([
-    ...state.playlist.map((t) => t.id),
-    ...state.playlist
-      .map((t) => t.bvid)
+  const { playlists, addTrack: addTrackToPlaylist } = usePlaylists();
+  const inSession = new Set([
+    ...state.items.map((item) => item.track.id),
+    ...state.items
+      .map((item) => item.track.bvid)
       .filter((bvid): bvid is string => Boolean(bvid)),
   ]);
 
@@ -158,15 +150,83 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
     () => cards ?? (tracks ?? []).map(legacyTrackCard),
     [cards, tracks]
   );
+  const [resolvedLocal, setResolvedLocal] = useState<Record<string, Track>>({});
+  const [resolutionComplete, setResolutionComplete] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    const unresolved = normalizedCards.filter(
+      (card) =>
+        !card.local_track &&
+        (card.source_type === "local" ||
+          Boolean(
+            card.bvid &&
+              (convertedSet.has(card.bvid) || card.download_status === "downloaded")
+          ))
+    );
+    for (const card of unresolved) {
+      if (resolvedLocal[card.track_id] || resolutionComplete.has(card.track_id)) continue;
+      const lookupPath =
+        card.source_type === "local"
+          ? `/api/tracks/by-id?track_id=${encodeURIComponent(card.track_id)}`
+          : `/api/tracks/by-bvid?bvid=${encodeURIComponent(card.bvid ?? "")}`;
+      fetch(apiUrl(lookupPath), {
+        cache: "no-store",
+      })
+        .then(async (response) => {
+          if (!response.ok) return null;
+          return (await response.json()) as Track;
+        })
+        .then((track) => {
+          if (!cancelled && track) {
+            setResolvedLocal((previous) => ({ ...previous, [card.track_id]: track }));
+          }
+        })
+        .catch(() => null)
+        .finally(() => {
+          if (!cancelled) {
+            setResolutionComplete((previous) => {
+              const next = new Set(previous);
+              next.add(card.track_id);
+              return next;
+            });
+          }
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [convertedSet, normalizedCards, resolutionComplete, resolvedLocal]);
+
+  const effectiveCards = useMemo(
+    () =>
+      normalizedCards.map((card) => {
+        const localTrack = resolvedLocal[card.track_id];
+        if (!localTrack) return card;
+        return {
+          ...card,
+          source_type: "local" as const,
+          availability: "local" as const,
+          title: localTrack.title,
+          author: localTrack.author,
+          bvid: localTrack.bvid,
+          url: localTrack.url,
+          download_status: "downloaded" as const,
+          allowed_actions: ["play", "add_to_session"] as TrackCardData["allowed_actions"],
+          local_track: localTrack,
+        };
+      }),
+    [normalizedCards, resolvedLocal]
+  );
   const uniqueTracks = useMemo(() => {
     const seen = new Set<string>();
-    return normalizedCards.filter((t) => {
+    return effectiveCards.filter((t) => {
       const key = t.bvid || t.track_id;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [normalizedCards]);
+  }, [effectiveCards]);
 
   const handleDownload = (track: TrackCardData) => {
     if (!track.bvid) return;
@@ -174,15 +234,19 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
     fetchDanmaku(track.bvid);
   };
 
-  const handleQueue = (track: TrackCardData) => {
+  const handleAdd = (track: TrackCardData) => {
     if (!track.local_track) return;
-    addTracks([track.local_track]);
+    addTracks([track.local_track], "agent");
     if (track.bvid) fetchDanmaku(track.bvid);
   };
 
   const handlePlay = (track: TrackCardData) => {
     if (!track.local_track) return;
-    playTrack(track.local_track);
+    const isCurrent =
+      state.current?.id === track.local_track.id ||
+      Boolean(track.bvid && state.current?.bvid === track.bvid);
+    if (isCurrent && !state.playing) void play();
+    else if (!isCurrent) playTrack(track.local_track);
     if (track.bvid) fetchDanmaku(track.bvid);
   };
 
@@ -198,8 +262,25 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
       <div className="max-h-[16rem] overflow-y-auto">
         {uniqueTracks.map((t) => {
           const localTrack = t.local_track;
-          const legacyForState = localTrack ?? ({ id: t.track_id, bvid: t.bvid } as TrackExt);
-          const btnState = getButtonState(legacyForState, inPlaylist, convertingSet, convertedSet);
+          const inCurrentSession = Boolean(
+            (localTrack && inSession.has(localTrack.id)) ||
+              (t.bvid && inSession.has(t.bvid))
+          );
+          const isCurrent = Boolean(
+            localTrack &&
+              (state.current?.id === localTrack.id ||
+                Boolean(t.bvid && state.current?.bvid === t.bvid))
+          );
+          const isDownloading = Boolean(t.bvid && convertingSet.has(t.bvid));
+          const wasDownloaded = Boolean(
+            t.download_status === "downloaded" ||
+              (t.bvid && convertedSet.has(t.bvid))
+          );
+          const isLocal = t.availability === "local" && Boolean(localTrack);
+          const isResolving =
+            t.source_type === "local" &&
+            !localTrack &&
+            !resolutionComplete.has(t.track_id);
           return (
             <div
               key={t.bvid || t.track_id}
@@ -228,20 +309,43 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                {t.allowed_actions.includes("play") && (
-                  <button onClick={() => handlePlay(t)} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase" style={{ color: "var(--color-primary)" }}>
-                    ▶ PLAY
+                {isLocal && (
+                  <button disabled={isCurrent && state.playing} onClick={() => handlePlay(t)} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
+                    {isCurrent && state.playing ? "PLAYING" : isCurrent ? "▶ RESUME" : "▶ PLAY"}
                   </button>
                 )}
-                {t.allowed_actions.includes("add_to_queue") && (
-                  <button onClick={() => handleQueue(t)} disabled={btnState === "added"} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
-                    {btnState === "added" ? "ADDED" : "+ ADD"}
+                {isLocal && (
+                  <button title="加入接下来播放" onClick={() => handleAdd(t)} disabled={inCurrentSession} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
+                    {inCurrentSession ? "ADDED" : "+ ADD"}
                   </button>
                 )}
-                {t.allowed_actions.includes("download") && (
-                  <button onClick={() => handleDownload(t)} disabled={btnState === "adding" || btnState === "downloaded"} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
-                    {btnState === "adding" ? "DOWNLOADING..." : btnState === "downloaded" ? "DOWNLOADED" : "⇩ DOWNLOAD"}
+                {isLocal && localTrack && (
+                  <select
+                    defaultValue=""
+                    disabled={playlists.length === 0}
+                    title={playlists.length ? "加入命名歌单" : "请先创建歌单"}
+                    onChange={(event) => {
+                      const targetPlaylistId = event.target.value;
+                      event.target.value = "";
+                      if (targetPlaylistId) void addTrackToPlaylist(targetPlaylistId, localTrack);
+                    }}
+                    className="max-w-24 rounded-full border border-[var(--glass-border)] bg-[var(--color-surface)] px-2 py-0.5 text-[10px] text-[var(--color-on-surface-muted)] disabled:opacity-40"
+                  >
+                    <option value="">PLAYLIST +</option>
+                    {playlists.map((playlist) => (
+                      <option key={playlist.id} value={playlist.id}>{playlist.name}</option>
+                    ))}
+                  </select>
+                )}
+                {!isLocal && t.source_type === "bilibili" && t.bvid && (
+                  <button onClick={() => handleDownload(t)} disabled={isDownloading || wasDownloaded} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
+                    {isDownloading ? "DOWNLOADING..." : wasDownloaded ? "DOWNLOADED" : "⇩ DOWNLOAD"}
                   </button>
+                )}
+                {!isLocal && t.source_type === "local" && (
+                  <span className="px-2 py-0.5 text-[10px] uppercase text-[color:var(--color-on-surface-muted)]">
+                    {isResolving ? "VERIFYING…" : "UNAVAILABLE"}
+                  </span>
                 )}
               </div>
             </div>

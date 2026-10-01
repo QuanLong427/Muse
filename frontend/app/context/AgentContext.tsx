@@ -236,6 +236,12 @@ export function AgentProvider({
     seek,
     setVolume,
     playTrack,
+    playCollection,
+    insertNext,
+    removeSessionItem,
+    reorderSession,
+    clearSession,
+    setPlaybackMode,
   } = usePlayer();
   const playerStateRef = useRef(playerState);
   useEffect(() => {
@@ -367,6 +373,79 @@ export function AgentProvider({
         playTrack(candidate as Track);
         break;
       }
+      case "play_collection": {
+        const tracks = actionData.tracks;
+        if (!Array.isArray(tracks) || tracks.length === 0) return false;
+        const canonical = tracks.filter(
+          (track): track is Track =>
+            Boolean(
+              track &&
+                typeof track === "object" &&
+                typeof (track as Partial<Track>).id === "string" &&
+                typeof (track as Partial<Track>).title === "string" &&
+                typeof (track as Partial<Track>).url === "string"
+            )
+        );
+        if (!canonical.length) return false;
+        playCollection(
+          canonical,
+          actionData.origin_type === "playlist" ? "playlist" : "manual",
+          typeof actionData.origin_id === "string" ? actionData.origin_id : null
+        );
+        break;
+      }
+      case "insert_next": {
+        const track = actionData.track;
+        if (!track || typeof track !== "object") return false;
+        const candidate = track as Partial<Track>;
+        if (
+          typeof candidate.id !== "string" ||
+          typeof candidate.title !== "string" ||
+          typeof candidate.url !== "string"
+        ) {
+          return false;
+        }
+        insertNext(candidate as Track, "agent");
+        break;
+      }
+      case "remove_session_item":
+        if (typeof actionData.item_id !== "string") return false;
+        removeSessionItem(actionData.item_id);
+        break;
+      case "reorder_session":
+        if (
+          !Array.isArray(actionData.item_ids) ||
+          !actionData.item_ids.every((id) => typeof id === "string")
+        ) {
+          return false;
+        }
+        if (!reorderSession(actionData.item_ids as string[])) return false;
+        break;
+      case "clear_session":
+        clearSession();
+        break;
+      case "set_playback_mode": {
+        const orderMode = actionData.order_mode;
+        const repeatMode = actionData.repeat_mode;
+        if (
+          orderMode !== undefined &&
+          orderMode !== "sequential" &&
+          orderMode !== "shuffle" &&
+          orderMode !== "radio"
+        ) {
+          return false;
+        }
+        if (
+          repeatMode !== undefined &&
+          repeatMode !== "off" &&
+          repeatMode !== "all" &&
+          repeatMode !== "one"
+        ) {
+          return false;
+        }
+        setPlaybackMode(orderMode, repeatMode);
+        break;
+      }
       case "pause":
         pause();
         break;
@@ -389,7 +468,7 @@ export function AgentProvider({
         return false;
     }
     return true;
-  }, [pause, play, playNext, playPrevious, playTrack, seek, setVolume, stop]);
+  }, [clearSession, insertNext, pause, play, playCollection, playNext, playPrevious, playTrack, removeSessionItem, reorderSession, seek, setPlaybackMode, setVolume, stop]);
 
   const { send, loading, cancel: sseCancel } = useSSE({
     url: apiUrl(chatApiPath),
@@ -473,7 +552,7 @@ export function AgentProvider({
       artist: t.author || "",
       bvid: t.bvid,
     }));
-    const msg = `请将以下B站视频转为音频并保存到本地曲库，不要自动加入播放队列:\n${JSON.stringify(items)}`;
+    const msg = `请将以下B站视频转为音频并保存到本地曲库，不要自动加入当前播放会话:\n${JSON.stringify(items)}`;
     send(msg, {
       user_id: userId ?? "local",
       session_id: sessionId ?? "default",
@@ -543,6 +622,7 @@ export function AgentProvider({
             if (data.history && Array.isArray(data.history)) {
             const clearOffset = data.clear_offset ?? 0;
             const filtered = data.history.slice(clearOffset);
+            const downloadedBvids = new Set<string>();
             const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => {
               const metadata =
                 record.metadata && typeof record.metadata === "object"
@@ -551,6 +631,14 @@ export function AgentProvider({
               const cards = Array.isArray(metadata.track_cards)
                 ? (metadata.track_cards as TrackCardData[])
                 : undefined;
+              cards?.forEach((card) => {
+                if (
+                  card.bvid &&
+                  (card.source_type === "local" || card.download_status === "downloaded")
+                ) {
+                  downloadedBvids.add(card.bvid);
+                }
+              });
               return {
                 id: newId(),
                 role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
@@ -560,6 +648,13 @@ export function AgentProvider({
               };
             });
             setMessages(historyMessages);
+            if (downloadedBvids.size) {
+              setConvertedSet((previous) => {
+                const next = new Set(previous);
+                downloadedBvids.forEach((bvid) => next.add(bvid));
+                return next;
+              });
+            }
           }
         }
       } catch {
@@ -674,14 +769,18 @@ export function AgentProvider({
                 bvid: currentPlayerState.current.bvid,
               }
             : null,
-          playlist: currentPlayerState.playlist.slice(0, 100).map((track) => ({
-            id: track.id,
-            title: track.title,
-            author: track.author,
-            bvid: track.bvid,
+          playback_session_id: currentPlayerState.sessionId,
+          current_item_id: currentPlayerState.currentItemId,
+          session_items: currentPlayerState.items.slice(0, 100).map((item) => ({
+            item_id: item.id,
+            id: item.track.id,
+            title: item.track.title,
+            author: item.track.author,
+            bvid: item.track.bvid,
+            origin_type: item.origin_type,
           })),
-          playlist_count: currentPlayerState.playlist.length,
-          playlist_truncated: currentPlayerState.playlist.length > 100,
+          session_item_count: currentPlayerState.items.length,
+          session_items_truncated: currentPlayerState.items.length > 100,
           index: currentPlayerState.index,
           playing: currentPlayerState.playing,
           progress: currentPlayerState.progress,

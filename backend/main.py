@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import bili, chat, config, dream, history, memory, playlist, scenario, search, tracks, voice, wiki
+from routers import bili, chat, config, dream, history, memory, music_library, playback, playlist, scenario, search, tracks, voice, wiki
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +54,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"[startup] System init failed: {e}")
 
-    # Startup: init playlist database
+    # Startup: initialize the playback session and migrate the legacy playlist table.
     try:
-        from services.playlist_store import init_playlist_db
-        init_playlist_db()
+        from services.playback_session_store import init_playback_session_db
+        init_playback_session_db()
+        from services.music_library_store import init_music_library_db
+        init_music_library_db()
     except Exception as e:
-        logger.error(f"[startup] Playlist DB init failed: {e}")
+        logger.error(f"[startup] Playback session DB init failed: {e}")
 
     # Startup: start dream scheduler
     _dream_task = asyncio.create_task(_dream_scheduler())
@@ -93,6 +95,8 @@ app.include_router(config.router)
 app.include_router(dream.router)
 app.include_router(history.router)
 app.include_router(memory.router)
+app.include_router(music_library.router)
+app.include_router(playback.router)
 app.include_router(playlist.router)
 app.include_router(scenario.router)
 app.include_router(search.router)

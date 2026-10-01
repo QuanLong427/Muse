@@ -9,7 +9,7 @@ Musicer 是一个由 AI Agent 驱动的个人音乐播放器：统一管理本�
 
 ## 当前稳定能力
 
-- Next.js 16 播放器：本地 MP3 扫描、Range 播放、队列、进度、音量和弹幕。
+- Next.js 16 播放器：本地曲库、最近播放、命名歌单、持久播放会话、顺序/随机袋/本地 Radio、循环策略、反馈、Range 播放、进度、音量和弹幕。
 - LangGraph ReAct Agent：Qwen3.5-Flash 多轮对话、SSE 流式输出、工具自主决策和浏览器播放器控制。
 - 本地与云端搜索：优先检索本地曲库，必要时搜索 B 站并在用户确认后转换为 MP3。
 - 语音交互：Qwen ASR 转写后进入同一 Agent，可选 Qwen TTS 播报回答。
@@ -18,7 +18,7 @@ Musicer 是一个由 AI Agent 驱动的个人音乐播放器：统一管理本�
 - 联网取证：为翻唱、Live、Remix 等易混淆版本搜索并抓取可核验来源。
 - Docker Compose：统一启动前端、后端并挂载音乐、记忆和 Wiki 数据。
 
-命名歌单、正式播放模式、推荐反馈闭环、向量语义召回和对话压缩仍属于规划能力，不能按已完成能力使用。范围和优先级见[需求文档](./docs/需求文档.md)。
+场景化智能歌单、近期偏好评分、完整推荐解释、向量语义召回和对话压缩仍属于规划能力，不能按已完成能力使用。当前 Radio 仅使用本地歌曲，并排除当前播放会话中的歌曲、近期播放和明确负向反馈。范围和优先级见[需求文档](./docs/需求文档.md)。
 
 ## 稳定架构
 
@@ -31,7 +31,7 @@ Browser
 FastAPI routers
   ├─ LangGraph ReAct Agent ── tools / skills / Qwen
   ├─ local music / Bilibili / voice / web evidence
-  ├─ memory v2 / playlist SQLite
+  ├─ memory v2 / playback-session SQLite
   └─ LLM-Wiki domain services
              │
              ▼
@@ -47,7 +47,7 @@ mounted music + memory/ + db/ + LLM-Wiki/
 | `frontend/` | 播放器、聊天、语音、弹幕和 Next.js API 路由 | `frontend/app/page.tsx` |
 | `backend/` | FastAPI、Agent、领域服务、持久化和外部接口 | `backend/main.py` |
 | `skills/` | Agent 可渐进加载的工作流、参考和受限脚本 | `skills/*/SKILL.md` |
-| `memory/` | 会话、长期记忆和播放队列运行时数据 | `memory/data/` |
+| `memory/` | 会话、长期记忆和播放会话运行时数据 | `memory/data/` |
 | `LLM-Wiki/` | 运行时生成的音乐知识库 | `skills/llm-wiki/SKILL.md` |
 | `docs/` | 需求、架构和外部参考 | `docs/项目架构说明.md` |
 

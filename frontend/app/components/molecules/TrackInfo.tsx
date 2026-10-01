@@ -38,6 +38,7 @@ export function TrackInfo({ track, playing }: Props) {
   }, [track?.id, track?.title]);
 
   const hasTrack = !!track;
+  const playbackLabel = !hasTrack ? "IDLE" : playing ? "PLAYING" : "PAUSED";
   const needsMarquee = textWidth > 0;
   const offset = textWidth + MQ_GAP;
 
@@ -99,7 +100,7 @@ export function TrackInfo({ track, playing }: Props) {
             opacity: hasTrack ? 1 : 0.5,
           }}
         >
-          PLAYING
+          {playbackLabel}
         </span>
         <SpectrumBars active={playing} muted={!hasTrack} />
         <DanmakuToggle />

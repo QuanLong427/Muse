@@ -4,10 +4,8 @@ import { useState } from "react";
 import { DanmakuOverlay, Logo, ModeSwitch } from "@/app/components/atoms";
 import {
   AgentChat,
-  ClockPanel,
   MusicVisualizer,
-  Player,
-  Playlist,
+  MusicWorkspace,
   SettingsModal,
   StatusBar,
 } from "@/app/components/organisms";
@@ -42,9 +40,7 @@ export default function Home() {
         <main className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden p-4 md:grid md:grid-cols-2 md:grid-rows-[1fr] md:gap-6 md:p-6">
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-hidden">
             <DanmakuOverlay />
-            <ClockPanel />
-            <Player />
-            <Playlist />
+            <MusicWorkspace />
           </div>
 
           <div className="flex min-h-0 min-w-0 flex-1">

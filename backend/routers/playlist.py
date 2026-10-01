@@ -16,12 +16,12 @@ class PlaylistRequest(BaseModel):
 
 @router.get("")
 async def read_playlist():
-    """Return the full playlist ordered by position."""
-    return {"tracks": get_playlist()}
+    """Deprecated: return the active playback-session tracks."""
+    return {"tracks": get_playlist(), "deprecated": True}
 
 
 @router.post("")
 async def write_playlist(req: PlaylistRequest):
-    """Replace the entire playlist."""
+    """Deprecated compatibility write for older clients."""
     set_playlist(req.tracks)
-    return {"status": "ok", "count": len(req.tracks)}
+    return {"status": "ok", "count": len(req.tracks), "deprecated": True}

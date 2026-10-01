@@ -368,7 +368,7 @@ def _build_tools(
 
     @tool
     def get_player_state() -> str:
-        """Get the current browser music-player state, including the current track, queue, playback status, progress, duration, and volume. Call this before answering questions about what is playing or before making state-dependent playback decisions."""
+        """Get the current browser music-player state, including the current track, playback session items, playback status, progress, duration, and volume. Call this before answering questions about what is playing or before making state-dependent playback decisions."""
         return json.dumps(player_snapshot, ensure_ascii=False, default=str)
 
     @tool
@@ -466,6 +466,310 @@ def _build_tools(
             },
             ensure_ascii=False,
         )
+
+    @tool
+    def list_music_playlists() -> str:
+        """List the user's durable named playlists and their canonical local tracks."""
+        from services.music_library_store import list_playlists
+
+        playlists = list_playlists(user_id)
+        return json.dumps({"playlists": playlists}, ensure_ascii=False, default=str)
+
+    @tool
+    def create_music_playlist(name: str, description: str = "") -> str:
+        """Create a durable named playlist. This does not change current playback."""
+        from services.music_library_store import create_playlist
+
+        try:
+            playlist = create_playlist(name, description, user_id)
+        except ValueError as exc:
+            return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+        return json.dumps({"status": "created", "playlist": playlist}, ensure_ascii=False)
+
+    @tool
+    def add_track_to_music_playlist(playlist_id: str, track_id: str) -> str:
+        """Add one exact local track to a named playlist without changing current playback."""
+        from services.music_library_store import add_playlist_track, get_playlist
+        from services.music_manager import find_track_by_id
+
+        playlist = get_playlist(playlist_id, user_id)
+        if playlist is None:
+            return json.dumps({"status": "not_found", "error": "歌单不存在"}, ensure_ascii=False)
+        track = find_track_by_id(track_id)
+        if track is None:
+            return json.dumps({"status": "not_found", "error": "本地歌曲不存在"}, ensure_ascii=False)
+        updated = add_playlist_track(
+            playlist_id,
+            track=track.model_dump(mode="json"),
+            expected_revision=playlist["revision"],
+            user_id=user_id,
+        )
+        return json.dumps({"status": "added", "playlist": updated}, ensure_ascii=False)
+
+    @tool
+    def play_music_playlist(playlist_id: str) -> str:
+        """Start playback from a named playlist by copying its current tracks into the browser PlaybackSession. The named playlist itself is not modified."""
+        if not player_snapshot.get("available", False):
+            return json.dumps(
+                {"status": "unavailable", "error": "当前请求没有可控制的浏览器播放器"},
+                ensure_ascii=False,
+            )
+        from services.music_library_store import get_playlist
+        from services.music_manager import find_track_by_id
+
+        playlist = get_playlist(playlist_id, user_id)
+        if playlist is None:
+            return json.dumps({"status": "not_found", "error": "歌单不存在"}, ensure_ascii=False)
+        tracks = []
+        missing = []
+        for item in playlist["items"]:
+            track = find_track_by_id(item["track"]["id"])
+            if track is None:
+                missing.append(item["track"]["id"])
+            else:
+                tracks.append(track.model_dump(mode="json"))
+        if not tracks:
+            return json.dumps({"status": "empty", "error": "歌单中没有可播放的本地歌曲"}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "status": "dispatched",
+                "playlist_id": playlist_id,
+                "missing_track_ids": missing,
+                "client_action": {
+                    "target": "player",
+                    "action": "play_collection",
+                    "tracks": tracks,
+                    "origin_type": "playlist",
+                    "origin_id": playlist_id,
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    @tool
+    def manage_music_playlist(
+        action: Literal["rename", "delete", "remove_track", "reorder", "copy", "save_current"],
+        playlist_id: str = "",
+        name: str = "",
+        track_id: str = "",
+        item_ids: list[str] | None = None,
+    ) -> str:
+        """Apply an exact durable named-playlist mutation.
+
+        `rename`, `delete`, `remove_track`, `reorder`, and `copy` require a
+        playlist_id. `copy` also requires the new name. `save_current` creates
+        a new named playlist from the browser PlaybackSession and requires a
+        name. These operations never delete local audio and never mutate the
+        current PlaybackSession.
+        """
+        from services.music_library_store import (
+            add_playlist_track,
+            create_playlist,
+            delete_playlist,
+            get_playlist,
+            PlaylistRevisionConflictError,
+            remove_playlist_item,
+            reorder_playlist_items,
+            update_playlist,
+        )
+        from services.music_manager import find_track_by_id
+
+        source = get_playlist(playlist_id, user_id) if playlist_id else None
+        if action != "save_current" and source is None:
+            return json.dumps({"status": "not_found", "error": "歌单不存在"}, ensure_ascii=False)
+
+        try:
+            if action == "rename":
+                if not name.strip():
+                    return json.dumps({"status": "invalid", "error": "缺少新歌单名称"}, ensure_ascii=False)
+                updated = update_playlist(
+                    playlist_id,
+                    name=name,
+                    description=source["description"],
+                    expected_revision=source["revision"],
+                    user_id=user_id,
+                )
+                return json.dumps({"status": "renamed", "playlist": updated}, ensure_ascii=False)
+
+            if action == "delete":
+                delete_playlist(
+                    playlist_id,
+                    expected_revision=source["revision"],
+                    user_id=user_id,
+                )
+                return json.dumps({"status": "deleted", "playlist_id": playlist_id}, ensure_ascii=False)
+
+            if action == "remove_track":
+                target = next(
+                    (item for item in source["items"] if item["track"]["id"] == track_id),
+                    None,
+                )
+                if target is None:
+                    return json.dumps({"status": "not_found", "error": "歌曲不在该歌单中"}, ensure_ascii=False)
+                updated = remove_playlist_item(
+                    playlist_id,
+                    target["id"],
+                    expected_revision=source["revision"],
+                    user_id=user_id,
+                )
+                return json.dumps({"status": "removed", "playlist": updated}, ensure_ascii=False)
+
+            if action == "reorder":
+                requested = item_ids or []
+                updated = reorder_playlist_items(
+                    playlist_id,
+                    requested,
+                    expected_revision=source["revision"],
+                    user_id=user_id,
+                )
+                return json.dumps({"status": "reordered", "playlist": updated}, ensure_ascii=False)
+
+            if action == "save_current" and not player_snapshot.get("available", False):
+                return json.dumps({"status": "unavailable", "error": "当前请求没有可读取的浏览器播放会话"}, ensure_ascii=False)
+            source_tracks = (
+                [item.get("track") for item in player_snapshot.get("items", [])]
+                if action == "save_current"
+                else [item["track"] for item in source["items"]]
+            )
+            if not name.strip():
+                return json.dumps({"status": "invalid", "error": "缺少新歌单名称"}, ensure_ascii=False)
+            if not source_tracks:
+                return json.dumps({"status": "empty", "error": "没有可保存的歌曲"}, ensure_ascii=False)
+            created = create_playlist(name, "", user_id)
+            try:
+                current_revision = created["revision"]
+                added_count = 0
+                for raw_track in source_tracks:
+                    if not isinstance(raw_track, dict):
+                        continue
+                    canonical = find_track_by_id(str(raw_track.get("id") or ""))
+                    if canonical is None:
+                        continue
+                    created = add_playlist_track(
+                        created["id"],
+                        track=canonical.model_dump(mode="json"),
+                        expected_revision=current_revision,
+                        user_id=user_id,
+                    )
+                    current_revision = created["revision"]
+                    added_count += 1
+                if added_count == 0:
+                    delete_playlist(
+                        created["id"],
+                        expected_revision=created["revision"],
+                        user_id=user_id,
+                    )
+                    return json.dumps({"status": "empty", "error": "没有仍存在的本地歌曲"}, ensure_ascii=False)
+            except Exception:
+                delete_playlist(
+                    created["id"],
+                    expected_revision=created["revision"],
+                    user_id=user_id,
+                )
+                raise
+            return json.dumps({"status": "created", "playlist": created}, ensure_ascii=False)
+        except (LookupError, ValueError, PlaylistRevisionConflictError) as exc:
+            return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+
+    @tool
+    def manage_playback_session(
+        action: Literal["insert_next", "remove", "clear", "reorder"],
+        track_id: str = "",
+        item_id: str = "",
+        item_ids: list[str] | None = None,
+    ) -> str:
+        """Mutate the browser PlaybackSession without changing named playlists.
+
+        Use canonical ids from local_search/get_player_state. `insert_next`
+        requires track_id, `remove` requires a session item_id, and `reorder`
+        requires every current session item id exactly once.
+        """
+        if not player_snapshot.get("available", False):
+            return json.dumps({"status": "unavailable", "error": "当前请求没有可控制的浏览器播放器"}, ensure_ascii=False)
+        current_items = [
+            item for item in player_snapshot.get("items", []) if isinstance(item, dict)
+        ]
+        current_ids = [str(item.get("id") or "") for item in current_items]
+        client_action: dict[str, Any] = {"target": "player"}
+        if action == "insert_next":
+            from services.music_manager import find_track_by_id
+
+            track = find_track_by_id(track_id)
+            if track is None:
+                return json.dumps({"status": "not_found", "error": "本地歌曲不存在"}, ensure_ascii=False)
+            client_action.update(
+                {"action": "insert_next", "track": track.model_dump(mode="json")}
+            )
+        elif action == "remove":
+            if item_id not in current_ids:
+                return json.dumps({"status": "not_found", "error": "播放会话中不存在该 item_id"}, ensure_ascii=False)
+            client_action.update({"action": "remove_session_item", "item_id": item_id})
+        elif action == "reorder":
+            requested = item_ids or []
+            if len(requested) != len(current_ids) or set(requested) != set(current_ids):
+                return json.dumps({"status": "invalid", "error": "重排必须提供全部 item_id 且每项一次"}, ensure_ascii=False)
+            client_action.update({"action": "reorder_session", "item_ids": requested})
+        else:
+            client_action["action"] = "clear_session"
+        return json.dumps({"status": "dispatched", "client_action": client_action}, ensure_ascii=False)
+
+    @tool
+    def set_playback_mode(
+        order_mode: Literal["sequential", "shuffle", "radio"] | None = None,
+        repeat_mode: Literal["off", "all", "one"] | None = None,
+    ) -> str:
+        """Set playback order and/or repeat policy without replacing the current track.
+
+        Radio only appends deterministic local candidates and never downloads.
+        """
+        if not player_snapshot.get("available", False):
+            return json.dumps({"status": "unavailable", "error": "当前请求没有可控制的浏览器播放器"}, ensure_ascii=False)
+        if order_mode is None and repeat_mode is None:
+            return json.dumps({"status": "invalid", "error": "至少提供一种模式"}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "status": "dispatched",
+                "client_action": {
+                    "target": "player",
+                    "action": "set_playback_mode",
+                    "order_mode": order_mode,
+                    "repeat_mode": repeat_mode,
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    @tool
+    def record_track_feedback(
+        track_id: str,
+        feedback_type: Literal[
+            "like",
+            "dislike",
+            "dislike_version",
+            "not_now",
+            "more_like_this",
+            "replay",
+            "favorite",
+        ],
+    ) -> str:
+        """Record explicit feedback for one canonical local track.
+
+        This appends behavioral evidence; it does not directly create a
+        permanent user memory. Use only for explicit user feedback.
+        """
+        from services.music_library_store import record_track_feedback as save_feedback
+        from services.music_manager import find_track_by_id
+
+        if find_track_by_id(track_id) is None:
+            return json.dumps({"status": "not_found", "error": "本地歌曲不存在"}, ensure_ascii=False)
+        event = save_feedback(
+            user_id=user_id,
+            track_id=track_id,
+            feedback_type=feedback_type,
+            scenario=scenario,
+            source="agent",
+        )
+        return json.dumps({"status": "recorded", "feedback": event}, ensure_ascii=False)
 
     @tool
     def bili_search(keyword: str) -> str:
@@ -783,6 +1087,14 @@ def _build_tools(
         get_player_state,
         control_player,
         play_track,
+        list_music_playlists,
+        create_music_playlist,
+        add_track_to_music_playlist,
+        play_music_playlist,
+        manage_music_playlist,
+        manage_playback_session,
+        set_playback_mode,
+        record_track_feedback,
         bili_search,
         local_search,
         present_tracks,
@@ -1132,17 +1444,7 @@ async def chat_stream(
                     episode_message_ids.append(tool_message_id)
                 except Exception:
                     logger.exception("[memory] failed to persist tool result")
-                if tool_name == "control_player":
-                    client_action = _extract_client_action(tool_output)
-                    if client_action:
-                        yield {
-                            "event": "output",
-                            "data": {
-                                "type": "client_action",
-                                **client_action,
-                            },
-                        }
-                elif tool_name == "play_track":
+                if tool_name in {"control_player", "play_track", "play_music_playlist"}:
                     client_action = _extract_client_action(tool_output)
                     if client_action:
                         yield {

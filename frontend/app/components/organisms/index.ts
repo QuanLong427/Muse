@@ -1,8 +1,13 @@
 export { AgentChat } from "./AgentChat";
 export { ClockPanel } from "./ClockPanel";
 export { MusicVisualizer } from "./MusicVisualizer";
+export { MusicWorkspace } from "./MusicWorkspace";
+export { LocalLibrary } from "./LocalLibrary";
+export { RecentPlays } from "./RecentPlays";
+export { MyPlaylists } from "./MyPlaylists";
 export { ParticleBackground } from "./ParticleBackground";
 export { Player } from "./Player";
-export { Playlist } from "./Playlist";
+export { PlaybackDetails } from "./PlaybackDetails";
+export { UpNext } from "./UpNext";
 export { SettingsModal } from "./SettingsModal";
 export { StatusBar } from "./StatusBar";

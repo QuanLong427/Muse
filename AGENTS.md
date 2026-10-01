@@ -24,7 +24,9 @@ Musicer 是一个面向个人曲库的智能音乐播放器。Next.js 前端负�
 | 记忆与 Dream | `backend/services/memory_store.py`、`backend/services/memory_manager.py` | `backend/services/episode_memory.py`、`backend/services/dream_engine.py`、`docs/记忆系统说明.md` |
 | LLM-Wiki | `skills/llm-wiki/SKILL.md` | `skills/llm-wiki/references/`、`skills/llm-wiki/scripts/`、`backend/services/wiki_*.py` |
 | 本地/B站搜索与下载 | `backend/services/music_manager.py`、`backend/services/bili_client.py` | `skills/local-search/`、`skills/cloud-search/`、`skills/convert/` |
-| 播放队列与状态 | `frontend/app/context/PlayerContext.tsx` | `backend/services/playlist_store.py`、`backend/routers/playlist.py` |
+| 播放会话与状态 | `frontend/app/context/PlayerContext.tsx` | `backend/services/playback_session_store.py`、`backend/routers/playback.py` |
+| 本地曲库、最近播放、命名歌单 | `frontend/app/components/organisms/MusicWorkspace.tsx` | `frontend/app/context/PlaylistContext.tsx`、`backend/services/music_library_store.py`、`backend/routers/music_library.py` |
+| 播放模式、Radio 与反馈 | `frontend/app/context/PlayerContext.tsx` | `backend/services/recommendation_service.py`、`backend/services/music_library_store.py` |
 | 语音 | `frontend/app/hooks/useVoiceRecorder.ts` | `backend/routers/voice.py`、`backend/services/voice_service.py` |
 | Docker 安装与运行 | `install.md`、`docker-compose.yml` | `backend/Dockerfile`、`frontend/Dockerfile` |
 | 测试 | `backend/tests/` | 与被修改服务同名的 `test_*.py` |

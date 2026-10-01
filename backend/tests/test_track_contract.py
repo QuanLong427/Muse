@@ -9,7 +9,7 @@ import json
 from services.track_contract import local_track_card, remote_track_card, track_cards_from_tool_result
 
 
-def test_local_card_exposes_play_and_queue_actions():
+def test_local_card_exposes_play_and_add_actions():
     track = Track(
         id="20261001/Coldplay-Yellow-BV1.mp3",
         title="Yellow",
@@ -26,8 +26,10 @@ def test_local_card_exposes_play_and_queue_actions():
 
     assert card.availability == "local"
     assert card.local_track == track
+    assert card.download_status == "downloaded"
     assert "download" not in card.allowed_actions
     assert "play" in card.allowed_actions
+    assert "add_to_session" in card.allowed_actions
 
 
 def test_remote_card_only_exposes_download():

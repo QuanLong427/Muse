@@ -5,10 +5,21 @@ import { ControlBar } from "@/app/components/molecules/ControlBar";
 import { SeekBar } from "@/app/components/molecules/SeekBar";
 import { TrackInfo } from "@/app/components/molecules/TrackInfo";
 import { VolumeControl } from "@/app/components/molecules/VolumeControl";
+import { PlaybackModeControl } from "@/app/components/molecules/PlaybackModeControl";
+import { TrackFeedbackControls } from "@/app/components/molecules/TrackFeedbackControls";
 import { usePlayer } from "@/app/context/PlayerContext";
 
 export function Player() {
-  const { state, next, prev, togglePlay, stop, seek, setVolume } = usePlayer();
+  const {
+    state,
+    next,
+    prev,
+    togglePlay,
+    stop,
+    seek,
+    setVolume,
+    setPlaybackMode,
+  } = usePlayer();
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -42,6 +53,12 @@ export function Player() {
         />
         <VolumeControl volume={state.volume} onChange={setVolume} />
       </div>
+      <PlaybackModeControl
+        orderMode={state.orderMode}
+        repeatMode={state.repeatMode}
+        onChange={setPlaybackMode}
+      />
+      <TrackFeedbackControls track={state.current} onNegative={next} />
       <SeekBar progress={state.progress} duration={state.duration} playing={state.playing} onSeek={seek} />
     </div>
   );

@@ -4,12 +4,31 @@ import type { Track } from "@/app/lib/types";
 import { apiUrl } from "@/app/lib/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export function useAudioPlayer(options?: { onEnded?: () => void }) {
+export type AudioPlaybackEvent = {
+  track: Track | null;
+  currentTime: number;
+  duration: number;
+};
+
+type LoadTrackOptions = {
+  startAt?: number;
+  autoplay?: boolean;
+};
+
+type AudioPlayerOptions = {
+  onPlay?: (event: AudioPlaybackEvent) => void;
+  onPause?: (event: AudioPlaybackEvent) => void;
+  onEnded?: (event: AudioPlaybackEvent) => void;
+};
+
+export function useAudioPlayer(options?: AudioPlayerOptions) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const onEndedRef = useRef(options?.onEnded);
+  const activeTrackRef = useRef<Track | null>(null);
+  const loadGenerationRef = useRef(0);
+  const optionsRef = useRef(options);
   useEffect(() => {
-    onEndedRef.current = options?.onEnded;
-  }, [options?.onEnded]);
+    optionsRef.current = options;
+  }, [options]);
 
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -28,11 +47,22 @@ export function useAudioPlayer(options?: { onEnded?: () => void }) {
       lastProgressUpdate = now;
       setProgress(Number.isFinite(el.currentTime) ? el.currentTime : 0);
     };
-    const syncPlayFlags = () => setPlaying(true);
-    const syncPauseFlags = () => setPlaying(false);
+    const eventSnapshot = (): AudioPlaybackEvent => ({
+      track: activeTrackRef.current,
+      currentTime: Number.isFinite(el.currentTime) ? el.currentTime : 0,
+      duration: Number.isFinite(el.duration) ? el.duration : 0,
+    });
+    const syncPlayFlags = () => {
+      setPlaying(true);
+      optionsRef.current?.onPlay?.(eventSnapshot());
+    };
+    const syncPauseFlags = () => {
+      setPlaying(false);
+      optionsRef.current?.onPause?.(eventSnapshot());
+    };
     const syncEnded = () => {
       setPlaying(false);
-      onEndedRef.current?.();
+      optionsRef.current?.onEnded?.(eventSnapshot());
     };
     const syncVol = () =>
       setVolumeState(Number.isFinite(el.volume) ? el.volume : 1);
@@ -41,7 +71,6 @@ export function useAudioPlayer(options?: { onEnded?: () => void }) {
     el.addEventListener("durationchange", syncDuration);
     el.addEventListener("timeupdate", syncProgress);
     el.addEventListener("play", syncPlayFlags);
-    el.addEventListener("playing", syncPlayFlags);
     el.addEventListener("pause", syncPauseFlags);
     el.addEventListener("ended", syncEnded);
     el.addEventListener("volumechange", syncVol);
@@ -55,7 +84,6 @@ export function useAudioPlayer(options?: { onEnded?: () => void }) {
       el.removeEventListener("durationchange", syncDuration);
       el.removeEventListener("timeupdate", syncProgress);
       el.removeEventListener("play", syncPlayFlags);
-      el.removeEventListener("playing", syncPlayFlags);
       el.removeEventListener("pause", syncPauseFlags);
       el.removeEventListener("ended", syncEnded);
       el.removeEventListener("volumechange", syncVol);
@@ -100,16 +128,36 @@ export function useAudioPlayer(options?: { onEnded?: () => void }) {
     if (audioRef.current) audioRef.current.volume = v;
   }, []);
 
-  const playTrack = useCallback((track: Track) => {
+  const playTrack = useCallback((track: Track, options: LoadTrackOptions = {}) => {
     const el = audioRef.current;
     if (!el) return;
+    const generation = ++loadGenerationRef.current;
+    const startAt = Math.max(0, options.startAt ?? 0);
+    const autoplay = options.autoplay ?? true;
+    activeTrackRef.current = track;
     el.src = apiUrl(track.url);
     el.load();
-    setProgress(0);
+    setProgress(startAt);
     setDuration(0);
-    void el.play().catch(() => {
-      /* ignore */
-    });
+    const prepare = () => {
+      if (
+        loadGenerationRef.current !== generation ||
+        activeTrackRef.current?.id !== track.id
+      ) {
+        return;
+      }
+      if (startAt > 0) {
+        el.currentTime = Math.min(startAt, Number.isFinite(el.duration) ? el.duration : startAt);
+        setProgress(el.currentTime);
+      }
+      if (autoplay) {
+        void el.play().catch(() => {
+          /* ignore */
+        });
+      }
+    };
+    if (el.readyState >= 1) prepare();
+    else el.addEventListener("loadedmetadata", prepare, { once: true });
   }, []);
 
   return {

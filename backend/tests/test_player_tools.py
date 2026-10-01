@@ -28,6 +28,14 @@ def test_player_tools_are_available_and_return_snapshot():
     assert "get_player_state" in tools
     assert "control_player" in tools
     assert "play_track" in tools
+    assert "list_music_playlists" in tools
+    assert "create_music_playlist" in tools
+    assert "add_track_to_music_playlist" in tools
+    assert "play_music_playlist" in tools
+    assert "manage_music_playlist" in tools
+    assert "manage_playback_session" in tools
+    assert "set_playback_mode" in tools
+    assert "record_track_feedback" in tools
     assert "search_memory" in tools
     assert "remember_preference" in tools
     assert "forget_preference" in tools
@@ -82,6 +90,55 @@ def test_extract_client_action_supports_langgraph_tool_message():
     assert _extract_client_action("not-json") is None
 
 
+def test_playback_session_and_mode_tools_dispatch_validated_actions(monkeypatch):
+    from models import Track
+
+    track = Track(
+        id="library/song.mp3",
+        title="Song",
+        author="Artist",
+        date="",
+        filename="song.mp3",
+        subDir="library",
+        size=1,
+        url="/api/tracks/library/song.mp3",
+    )
+    monkeypatch.setattr("services.music_manager.find_track_by_id", lambda track_id: track)
+    tools = _tools_by_name(
+        {
+            "available": True,
+            "items": [{"id": "item-1", "track": track.model_dump(mode="json")}],
+        }
+    )
+
+    insert = json.loads(
+        tools["manage_playback_session"].invoke(
+            {"action": "insert_next", "track_id": track.id}
+        )
+    )
+    assert insert["client_action"]["action"] == "insert_next"
+    assert insert["client_action"]["track"]["id"] == track.id
+
+    mode = json.loads(
+        tools["set_playback_mode"].invoke(
+            {"order_mode": "shuffle", "repeat_mode": "all"}
+        )
+    )
+    assert mode["client_action"] == {
+        "target": "player",
+        "action": "set_playback_mode",
+        "order_mode": "shuffle",
+        "repeat_mode": "all",
+    }
+
+    invalid_reorder = json.loads(
+        tools["manage_playback_session"].invoke(
+            {"action": "reorder", "item_ids": []}
+        )
+    )
+    assert invalid_reorder["status"] == "invalid"
+
+
 def test_play_track_dispatches_exact_canonical_track(monkeypatch):
     from models import Track
 
@@ -105,3 +162,40 @@ def test_play_track_dispatches_exact_canonical_track(monkeypatch):
     assert result["client_action"]["action"] == "play_track"
     assert result["client_action"]["track_id"] == track.id
     assert result["client_action"]["track"]["title"] == "最长的电影"
+
+
+def test_manage_playlist_saves_current_session_as_named_playlist(monkeypatch, tmp_path):
+    from models import Track
+    from services import music_library_store as store
+
+    track = Track(
+        id="library/song.mp3",
+        title="Song",
+        author="Artist",
+        date="",
+        filename="song.mp3",
+        subDir="library",
+        size=1,
+        url="/api/tracks/library/song.mp3",
+    )
+    monkeypatch.setattr(store, "_DB_DIR", tmp_path)
+    monkeypatch.setattr(store, "_DB_PATH", tmp_path / "music-library.db")
+    monkeypatch.setattr("services.music_manager.find_track_by_id", lambda track_id: track)
+    tools = _tools_by_name(
+        {
+            "available": True,
+            "items": [{"id": "item-1", "track": track.model_dump(mode="json")}],
+        }
+    )
+
+    result = json.loads(
+        tools["manage_music_playlist"].invoke(
+            {"action": "save_current", "name": "当前播放"}
+        )
+    )
+
+    assert result["status"] == "created"
+    assert result["playlist"]["name"] == "当前播放"
+    assert [item["track"]["id"] for item in result["playlist"]["items"]] == [
+        track.id
+    ]

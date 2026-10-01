@@ -17,6 +17,10 @@ from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
 
 _FENCED_BLOCK = re.compile(r"```(?:bash|sh|shell|powershell|cmd)?\s*\n([\s\S]*?)```", re.I)
+_LEGACY_TRACK_BLOCK = re.compile(r"```(?:tracks|added)\s*\n[\s\S]*?```", re.I)
+_LEGACY_TRACK_JSON = re.compile(
+    r"```json\s*\n\s*(?:\[\s*\{|\{\s*\"tracks\"\s*:)", re.I
+)
 _DEFERRED_ENDINGS = (
     "让我先搜索",
     "让我搜索一下",
@@ -29,9 +33,42 @@ _DEFERRED_ENDINGS = (
 _ACTION_CLAIM_PATTERNS = (
     (
         "播放",
-        {"control_player", "play_track"},
+        {"control_player", "play_track", "play_music_playlist"},
         re.compile(
             r"(?:已经|已)(?:成功)?(?:为(?:您|你))?(?:成功)?(?:开始)?播放|播放成功"
+        ),
+    ),
+    (
+        "创建歌单",
+        {"create_music_playlist", "manage_music_playlist"},
+        re.compile(r"(?:已经|已)(?:成功)?创建(?:了)?歌单|歌单创建成功"),
+    ),
+    (
+        "加入歌单",
+        {"add_track_to_music_playlist", "manage_music_playlist"},
+        re.compile(r"(?:已经|已)(?:成功)?(?:将[^。！？；;\n]{0,40})?加入(?:了)?歌单"),
+    ),
+    (
+        "修改歌单",
+        {"manage_music_playlist"},
+        re.compile(r"(?:已经|已)(?:成功)?(?:重命名|删除|复制|重排)(?:了)?歌单"),
+    ),
+    (
+        "修改待播内容",
+        {"manage_playback_session"},
+        re.compile(r"(?:已经|已)(?:成功)?(?:清空|重排|移除|插入)(?:了)?(?:当前)?(?:播放会话|待播内容|下一首)"),
+    ),
+    (
+        "切换播放模式",
+        {"set_playback_mode"},
+        re.compile(r"(?:已经|已)(?:成功)?(?:切换|设置)(?:为)?(?:顺序|随机|列表循环|单曲循环|播完停止)"),
+    ),
+    (
+        "记录歌曲反馈",
+        {"record_track_feedback"},
+        re.compile(
+            r"(?:已经|已)(?:成功)?(?:记录|标记)(?:了)?(?:您|你)?(?:对)?[^。！？；;\n]{0,40}"
+            r"(?:喜欢|不喜欢|暂时不听|版本反馈)"
         ),
     ),
     (
@@ -154,6 +191,12 @@ def validate_final_response(
     if not stripped:
         return ProtocolViolation("empty_final", "最终回答为空")
 
+    if _LEGACY_TRACK_BLOCK.search(stripped) or _LEGACY_TRACK_JSON.search(stripped):
+        return ProtocolViolation(
+            "fabricated_track_cards",
+            "回答自行输出了旧版 Track 数据块；交互卡片必须来自 present_tracks 的真实工具结果",
+        )
+
     tool_names = {name for name in registered_tools if name}
     for block in _FENCED_BLOCK.findall(stripped):
         for name in tool_names:
@@ -183,7 +226,7 @@ def validate_final_response(
     observed = observed_tool_names(messages)
     action_claims = _action_claims(stripped)
     playback_claimed = any(
-        label in {"播放", "暂停", "下一首", "上一首"}
+        label in {"播放", "暂停", "下一首", "上一首", "修改待播内容", "切换播放模式"}
         for label, _ in action_claims
     )
     if _has_dispatched_client_action(messages) and playback_claimed:
