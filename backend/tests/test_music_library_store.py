@@ -121,3 +121,28 @@ def test_feedback_is_append_only_and_latest_negative_controls_exclusion(monkeypa
     summary = store.get_track_feedback_summary(user_id="local", track_id="track-1")
     assert summary[0]["latest_feedback"] == "like"
     assert summary[0]["counts"] == {"like": 1, "dislike": 1}
+
+
+def test_recommendation_batch_is_immutable_and_user_scoped(monkeypatch, tmp_path):
+    _use_isolated_db(monkeypatch, tmp_path)
+    batch = store.record_recommendation_batch(
+        user_id="local",
+        kind="radio",
+        scenario="夜跑",
+        current_track_id="current.mp3",
+        profile_snapshot={"policy_version": "recent-preference-v1"},
+        constraints={"limit": 1},
+        items=[
+            {
+                "track": _track("recommended.mp3"),
+                "score": 0.75,
+                "reasons": [{"code": "recent_artist_affinity"}],
+            }
+        ],
+    )
+
+    assert batch["kind"] == "radio"
+    assert batch["scenario"] == "夜跑"
+    assert batch["items"][0]["track_id"] == "recommended.mp3"
+    assert batch["items"][0]["reasons"] == [{"code": "recent_artist_affinity"}]
+    assert store.get_recommendation_batch(batch["id"], user_id="someone-else") is None

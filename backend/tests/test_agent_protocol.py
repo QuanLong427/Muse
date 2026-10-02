@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -5,7 +6,11 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from services.agent_protocol import validate_final_response
+from services.agent_protocol import (
+    ProtocolViolation,
+    safe_protocol_response,
+    validate_final_response,
+)
 
 
 TOOLS = {
@@ -16,6 +21,7 @@ TOOLS = {
     "manage_playback_session",
     "set_playback_mode",
     "record_track_feedback",
+    "recommend_next",
 }
 
 
@@ -96,6 +102,65 @@ def test_rejects_definite_playback_claim_without_client_ack():
     assert violation.code == "unconfirmed_client_action"
 
 
+def test_allows_definite_playback_claim_after_matching_client_ack():
+    action_id = "action-1"
+    tool_message = ToolMessage(
+        content=json.dumps(
+            {
+                "status": "dispatched",
+                "client_action": {
+                    "target": "player",
+                    "action": "play_track",
+                    "action_id": action_id,
+                },
+            }
+        ),
+        tool_call_id="call-1",
+        name="play_track",
+    )
+
+    violation = validate_final_response(
+        "已播放《最长的电影》。",
+        [tool_message],
+        TOOLS | {"play_track"},
+        client_action_results={
+            action_id: {"status": "succeeded", "result": {"observed": "playing"}}
+        },
+    )
+
+    assert violation is None
+
+
+def test_rejects_success_claim_after_failed_client_ack():
+    action_id = "action-1"
+    tool_message = ToolMessage(
+        content=json.dumps(
+            {
+                "status": "dispatched",
+                "client_action": {
+                    "target": "player",
+                    "action": "play_track",
+                    "action_id": action_id,
+                },
+            }
+        ),
+        tool_call_id="call-1",
+        name="play_track",
+    )
+
+    violation = validate_final_response(
+        "已播放《最长的电影》。",
+        [tool_message],
+        TOOLS | {"play_track"},
+        client_action_results={
+            action_id: {"status": "failed", "result": {"error": "audio error"}}
+        },
+    )
+
+    assert violation is not None
+    assert violation.code == "client_action_failed"
+
+
 def test_allows_dispatch_wording_with_real_tool_message():
     violation = validate_final_response(
         "已向播放器发送《最长的电影》的播放指令。",
@@ -171,3 +236,106 @@ def test_allows_feedback_claim_with_real_tool_observation():
     )
 
     assert violation is None
+
+
+def test_rejects_unconfirmed_recommendation_append_claim():
+    violation = validate_final_response(
+        "已将推荐歌曲加入接下来播放。",
+        [
+            ToolMessage(
+                content='{"status":"dispatched","client_action":{"target":"player","action":"add_tracks"}}',
+                tool_call_id="call-radio",
+                name="recommend_next",
+            )
+        ],
+        TOOLS,
+    )
+
+    assert violation is not None
+    assert violation.code == "unconfirmed_client_action"
+
+
+def test_safe_recovery_uses_presented_track_evidence():
+    response = safe_protocol_response(
+        ProtocolViolation("fabricated_track_cards", "invalid legacy block"),
+        [
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "presented",
+                        "tracks": [
+                            {"track_id": "one", "title": "一路向北"},
+                            {"track_id": "two", "title": "最长的电影"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id="call-present",
+                name="present_tracks",
+            )
+        ],
+    )
+
+    assert "2 个可验证的歌曲结果" in response
+    assert "歌曲卡片" in response
+
+
+def test_rejects_undisclosed_recommendation_source_fallback():
+    messages = [
+        ToolMessage(
+            content=json.dumps(
+                {
+                    "status": "partial",
+                    "source_plan": {
+                        "planned": {"local": 2, "cloud": 2},
+                        "actual": {"local": 2, "cloud": 0},
+                    },
+                    "user_notice": "在线候选不足，已使用本地歌曲补足；本地 2 首、在线 0 首。",
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call-recommend",
+            name="recommend_music",
+        )
+    ]
+
+    violation = validate_final_response("为你找到了两首本地歌曲。", messages, TOOLS)
+
+    assert violation is not None
+    assert violation.code == "undisclosed_recommendation_fallback"
+    assert validate_final_response(
+        "在线候选不足，因此这次只找到两首本地歌曲。", messages, TOOLS
+    ) is None
+
+
+def test_safe_recovery_includes_recommendation_fallback_notice():
+    response = safe_protocol_response(
+        ProtocolViolation("undisclosed_recommendation_fallback", "missing notice"),
+        [
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "partial",
+                        "user_notice": "B站搜索暂时不可用，已将推荐动态调整为本地 2 首。",
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id="call-recommend",
+                name="recommend_music",
+            ),
+            ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "presented",
+                        "tracks": [{"track_id": "one", "title": "一路向北"}],
+                    },
+                    ensure_ascii=False,
+                ),
+                tool_call_id="call-present",
+                name="present_tracks",
+            ),
+        ],
+    )
+
+    assert "B站搜索暂时不可用" in response
+    assert "1 个可验证的歌曲结果" in response

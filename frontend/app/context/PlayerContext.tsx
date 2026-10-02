@@ -14,6 +14,7 @@ import {
   type AudioPlaybackEvent,
 } from "@/app/hooks/useAudioPlayer";
 import { apiUrl } from "@/app/lib/api";
+import { useScenario } from "@/app/context/ScenarioContext";
 import {
   createContext,
   useCallback,
@@ -100,6 +101,7 @@ function shuffled(values: string[]): string[] {
 }
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
+  const { currentScenario } = useScenario();
   const [sessionId, setSessionId] = useState("playback:local");
   const [revision, setRevision] = useState(0);
   const [items, setItems] = useState<PlaybackSessionItem[]>([]);
@@ -156,10 +158,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           duration_seconds: event.duration,
           origin_type: item?.origin_type ?? "manual",
           origin_id: item?.origin_id ?? null,
+          scenario: currentScenario,
         }),
       }).catch(() => undefined);
     },
-    [sessionId]
+    [currentScenario, sessionId]
   );
 
   const handlePlayEvent = useCallback(
@@ -455,7 +458,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const remaining = activeIndex >= 0 ? items.length - activeIndex - 1 : items.length;
     if (remaining >= 3) return;
     const excludeTrackIds = items.map((item) => item.track.id);
-    const requestKey = `${currentItemId ?? "none"}:${excludeTrackIds.join("|")}`;
+    const requestKey = `${currentScenario}:${currentItemId ?? "none"}:${excludeTrackIds.join("|")}`;
     if (radioRequestKeyRef.current === requestKey) return;
     radioRequestKeyRef.current = requestKey;
     void fetch(apiUrl("/api/recommendations/radio"), {
@@ -465,19 +468,21 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         user_id: "local",
         exclude_track_ids: excludeTrackIds,
         limit: 5,
+        scenario: currentScenario,
+        current_track_id: current?.id ?? null,
       }),
     })
       .then(async (response) => {
         if (!response.ok) throw new Error("radio recommendation unavailable");
-        return (await response.json()) as { tracks?: Track[] };
+        return (await response.json()) as { tracks?: Track[]; batch_id?: string | null };
       })
       .then((payload) => {
         if (payload.tracks?.length) {
-          addTracks(payload.tracks, "radio", `radio:${Date.now()}`);
+          addTracks(payload.tracks, "radio", payload.batch_id ?? `radio:${Date.now()}`);
         }
       })
       .catch(() => undefined);
-  }, [addTracks, currentItemId, items, orderMode]);
+  }, [addTracks, current, currentItemId, currentScenario, items, orderMode]);
 
   const removeSessionItem = useCallback(
     (itemId: string) => {

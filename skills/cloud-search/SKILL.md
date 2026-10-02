@@ -1,6 +1,6 @@
 ---
 name: cloud-search
-description: 通过 B站 API 搜索云端视频资源，支持音乐、科普、课程、演讲、访谈、纪录片等多种类型，只有在本地没有搜索到音乐或者视频资源的时候才使用这个skill
+description: 通过 B站 API 搜索明确的云端视频资源；用于用户指定云端来源或本地精确查找无结果后的补充，不负责个性化推荐编排
 ---
 ## 云端搜索 Skill
 
@@ -13,6 +13,9 @@ description: 通过 B站 API 搜索云端视频资源，支持音乐、科普、
 2. 用户明确说"去B站搜"、"云端搜索"、"网上找"
 
 **禁止在未调用 local_search 的情况下直接使用本 Skill。**
+
+例外：推荐意图由 `music-recommendation` Skill 和 `recommend_music` 统一编排，
+它可以按用户指定来源或默认本地/云端配额直接使用云端检索能力。
 
 ### 搜索步骤
 

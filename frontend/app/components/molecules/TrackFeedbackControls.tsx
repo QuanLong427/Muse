@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { apiUrl } from "@/app/lib/api";
 import type { Track } from "@/app/lib/types";
+import { useScenario } from "@/app/context/ScenarioContext";
 
 type FeedbackType = "like" | "dislike" | "dislike_version" | "not_now";
 
@@ -20,6 +21,7 @@ export function TrackFeedbackControls({
   track: Track | null;
   onNegative?: () => void;
 }) {
+  const { currentScenario } = useScenario();
   const [latest, setLatest] = useState<string>("");
   const [busy, setBusy] = useState(false);
 
@@ -52,6 +54,7 @@ export function TrackFeedbackControls({
           user_id: "local",
           track_id: track.id,
           feedback_type: feedbackType,
+          scenario: currentScenario,
           source: "player_ui",
         }),
       });

@@ -11,6 +11,7 @@ node_modules
 
 # testing
 /coverage
+/.pytest_cache/
 /backend/.pytest-tmp/
 /backend/.pytest_cache/
 /secrets/*

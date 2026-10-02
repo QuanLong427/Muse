@@ -96,3 +96,24 @@ def test_bili_search_serializes_models_and_registers_presentable_ids(monkeypatch
     assert result["videos"][0]["bvid"] == "BV123"
     assert presented["status"] == "presented"
     assert presented["tracks"][0]["track_id"] == "bilibili:BV123"
+
+
+def test_bili_search_retries_transient_failure_and_returns_error_to_agent(monkeypatch):
+    import httpx
+
+    calls = 0
+
+    async def failing_search(client, keyword):
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("temporary timeout")
+
+    monkeypatch.setattr("services.bili_client.search_videos", failing_search)
+
+    result = json.loads(_tools()["bili_search"].invoke({"keyword": "周杰伦"}))
+
+    assert calls == 2
+    assert result["status"] == "error"
+    assert result["error_code"] == "bilibili_transient_error"
+    assert result["retryable"] is True
+    assert result["attempts"] == 2

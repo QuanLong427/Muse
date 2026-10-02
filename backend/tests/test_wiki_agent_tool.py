@@ -216,7 +216,14 @@ def test_convert_video_returns_ingest_ready_metadata_without_writing_wiki(tmp_pa
         "video_title": "原始视频标题",
         "url": "https://www.bilibili.com/video/BV123",
         "local_file_path": str(
-            (next(tmp_path.iterdir()) / "测试歌手-测试歌曲-BV123.mp3").resolve()
+            (
+                next(
+                    path
+                    for path in tmp_path.iterdir()
+                    if path.is_dir() and path.name.isdigit()
+                )
+                / "测试歌手-测试歌曲-BV123.mp3"
+            ).resolve()
         ),
         "existing": False,
     }

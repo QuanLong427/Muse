@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import quote
 
@@ -118,17 +119,42 @@ def find_track_by_id(track_id: str) -> Track | None:
     return next((track for track in scan_tracks() if track.id == track_id), None)
 
 
+def _normalize_search_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
 def search_tracks(query: str, limit: int = 20) -> list[Track]:
     all_tracks = scan_tracks()
     if not query:
         return all_tracks[:limit]
 
-    q = query.lower()
-    filtered = [
-        t for t in all_tracks
-        if q in f"{t.title} {t.author} {t.filename}".lower()
+    tokens = [
+        token
+        for token in (
+            _normalize_search_text(part) for part in re.split(r"\s+", query.strip())
+        )
+        if token
     ]
-    return filtered[:limit]
+    if not tokens:
+        return all_tracks[:limit]
+
+    ranked: list[tuple[int, str, Track]] = []
+    for track in all_tracks:
+        title = _normalize_search_text(track.title)
+        author = _normalize_search_text(track.author)
+        haystack = _normalize_search_text(
+            f"{track.title} {track.author} {track.filename}"
+        )
+        if not all(token in haystack for token in tokens):
+            continue
+        score = sum(
+            4 if token == title else 3 if token in title else 2 if token in author else 1
+            for token in tokens
+        )
+        ranked.append((-score, track.id, track))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [track for _, _, track in ranked[:limit]]
 
 
 def scan_subdir(sub_dir: str) -> list[Track]:

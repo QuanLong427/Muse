@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
@@ -69,6 +69,14 @@ _ACTION_CLAIM_PATTERNS = (
         re.compile(
             r"(?:已经|已)(?:成功)?(?:记录|标记)(?:了)?(?:您|你)?(?:对)?[^。！？；;\n]{0,40}"
             r"(?:喜欢|不喜欢|暂时不听|版本反馈)"
+        ),
+    ),
+    (
+        "补充推荐歌曲",
+        {"recommend_next"},
+        re.compile(
+            r"(?:已经|已)(?:成功)?(?:将|把)[^。！？；;\n]{0,60}"
+            r"(?:推荐歌曲|歌曲)(?:加入|添加)(?:到|进)?(?:了)?(?:播放详情|待播内容|接下来播放)"
         ),
     ),
     (
@@ -137,7 +145,8 @@ def observed_tool_names(messages: Iterable[BaseMessage]) -> set[str]:
     return names
 
 
-def _has_dispatched_client_action(messages: Iterable[BaseMessage]) -> bool:
+def _dispatched_client_actions(messages: Iterable[BaseMessage]) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
     for message in messages:
         if not isinstance(message, ToolMessage):
             continue
@@ -153,8 +162,42 @@ def _has_dispatched_client_action(messages: Iterable[BaseMessage]) -> bool:
             and payload.get("status") == "dispatched"
             and isinstance(payload.get("client_action"), dict)
         ):
-            return True
-    return False
+            actions.append(payload["client_action"])
+    return actions
+
+
+def dispatched_client_action_ids(messages: Iterable[BaseMessage]) -> list[str]:
+    """Return correlated browser action ids in observation order."""
+    return [
+        str(action["action_id"])
+        for action in _dispatched_client_actions(messages)
+        if isinstance(action.get("action_id"), str) and action["action_id"]
+    ]
+
+
+def _latest_recommendation_fallback(
+    messages: Iterable[BaseMessage],
+) -> dict[str, Any] | None:
+    for message in reversed(list(messages)):
+        if not isinstance(message, ToolMessage) or getattr(message, "name", "") != "recommend_music":
+            continue
+        try:
+            payload = json.loads(_message_text(message))
+        except json.JSONDecodeError:
+            return None
+        notice = str(payload.get("user_notice") or "").strip() if isinstance(payload, dict) else ""
+        if notice:
+            return payload
+        return None
+    return None
+
+
+def _discloses_recommendation_fallback(text: str) -> bool:
+    return (
+        "本地" in text
+        and bool(re.search(r"B站|云端|在线", text, re.I))
+        and bool(re.search(r"不足|不可用|失败|调整|补足|只找到|未找到", text))
+    )
 
 
 def _is_capability_description(text: str, claim_start: int) -> bool:
@@ -185,6 +228,7 @@ def validate_final_response(
     text: str,
     messages: Iterable[BaseMessage],
     registered_tools: Iterable[str],
+    client_action_results: dict[str, dict[str, Any]] | None = None,
 ) -> ProtocolViolation | None:
     """Validate a proposed terminal answer without imposing a tool route."""
     stripped = text.strip()
@@ -223,17 +267,52 @@ def validate_final_response(
             "回答以准备搜索或执行的承诺结束，但没有完成当前请求",
         )
 
+    recommendation_fallback = _latest_recommendation_fallback(messages)
+    if recommendation_fallback and not _discloses_recommendation_fallback(stripped):
+        return ProtocolViolation(
+            "undisclosed_recommendation_fallback",
+            "推荐来源发生了动态调整，最终回答必须说明："
+            + str(recommendation_fallback.get("user_notice") or ""),
+        )
+
     observed = observed_tool_names(messages)
     action_claims = _action_claims(stripped)
     playback_claimed = any(
-        label in {"播放", "暂停", "下一首", "上一首", "修改待播内容", "切换播放模式"}
+        label in {
+            "播放",
+            "暂停",
+            "下一首",
+            "上一首",
+            "修改待播内容",
+            "切换播放模式",
+            "补充推荐歌曲",
+        }
         for label, _ in action_claims
     )
-    if _has_dispatched_client_action(messages) and playback_claimed:
-        return ProtocolViolation(
-            "unconfirmed_client_action",
-            "播放器工具只确认指令已下发，尚未收到浏览器执行 ACK；请表述为已发送相应指令",
-        )
+    dispatched_actions = _dispatched_client_actions(messages)
+    if dispatched_actions:
+        action_results = client_action_results or {}
+        failed: list[dict[str, Any]] = []
+        unconfirmed: list[dict[str, Any]] = []
+        for action in dispatched_actions:
+            action_id = action.get("action_id")
+            result = action_results.get(str(action_id)) if action_id else None
+            if not isinstance(result, dict) or result.get("status") != "succeeded":
+                if isinstance(result, dict) and result.get("status") == "failed":
+                    failed.append(result)
+                else:
+                    unconfirmed.append(action)
+        if failed and not re.search(r"(?:失败|未能|无法|错误|没有成功)", stripped):
+            error = str(failed[-1].get("result", {}).get("error") or "播放器执行失败")
+            return ProtocolViolation(
+                "client_action_failed",
+                f"浏览器已返回动作失败 ACK：{error}",
+            )
+        if unconfirmed and playback_claimed:
+            return ProtocolViolation(
+                "unconfirmed_client_action",
+                "播放器工具只确认指令已下发，尚未收到浏览器执行 ACK；请表述为已发送相应指令",
+            )
     for claim, allowed_tools in action_claims:
         if not observed.intersection(allowed_tools):
             user_text = _latest_user_text(messages)
@@ -253,3 +332,60 @@ def repair_instruction(violation: ProtocolViolation) -> str:
         "如果不需要工具，请直接给出完整最终回答。"
         "不要输出工具命令示例，也不要以‘让我先处理’之类的承诺结束。"
     )
+
+
+def safe_protocol_response(
+    violation: ProtocolViolation,
+    messages: Iterable[BaseMessage],
+    client_action_results: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Build an evidence-backed terminal response when model repair still fails."""
+    message_list = list(messages)
+    recommendation_fallback = _latest_recommendation_fallback(message_list)
+    recommendation_notice = (
+        str(recommendation_fallback.get("user_notice") or "").strip()
+        if recommendation_fallback
+        else ""
+    )
+    actions = _dispatched_client_actions(message_list)
+    results = client_action_results or {}
+    if actions:
+        action = actions[-1]
+        action_id = str(action.get("action_id") or "")
+        result = results.get(action_id, {})
+        status = result.get("status")
+        action_name = str(action.get("action") or "播放器操作")
+        track = action.get("track")
+        track_title = (
+            str(track.get("title") or "") if isinstance(track, dict) else ""
+        )
+        subject = f"《{track_title.strip('《》')}》" if track_title else "该播放器操作"
+        if status == "succeeded":
+            if action_name in {"play", "play_track", "play_collection", "next", "previous"}:
+                return f"播放器已确认执行成功：正在播放{subject}。"
+            return "播放器已确认执行成功。"
+        if status == "failed":
+            error = str(result.get("result", {}).get("error") or "未知错误")
+            return f"播放器执行失败：{error}"
+        return "播放指令已经发送，但暂未收到浏览器的执行确认。请检查播放器状态。"
+
+    for message in reversed(message_list):
+        if not isinstance(message, ToolMessage) or getattr(message, "name", "") != "present_tracks":
+            continue
+        try:
+            payload = json.loads(_message_text(message))
+        except json.JSONDecodeError:
+            continue
+        tracks = payload.get("tracks") if isinstance(payload, dict) else None
+        if isinstance(tracks, list) and tracks:
+            presentation = (
+                f"已找到 {len(tracks)} 个可验证的歌曲结果，并展示为歌曲卡片。"
+                "你可以直接从卡片中选择播放、加入待播或下载。"
+            )
+            return f"{recommendation_notice}\n\n{presentation}" if recommendation_notice else presentation
+
+    if violation.code == "fabricated_track_cards":
+        return "歌曲数据未通过真实性校验，因此没有展示未经工具确认的候选。"
+    if violation.code in {"textual_tool_call", "unfinished_action"}:
+        return "这次没有形成真实工具执行结果，因此未执行相关操作。请直接告诉我具体目标后重试。"
+    return f"本次请求未形成可验证结果：{violation.message}"

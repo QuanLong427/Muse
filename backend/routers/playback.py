@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -39,6 +39,13 @@ class PlaybackSessionRequest(BaseModel):
     items: list[PlaybackSessionItemRequest] = Field(default_factory=list, max_length=1000)
 
 
+class PlayerActionAckRequest(BaseModel):
+    user_id: str = Field(default=DEFAULT_USER_ID, min_length=1, max_length=128)
+    session_id: str = Field(default="default", min_length=1, max_length=128)
+    status: Literal["succeeded", "failed"]
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("")
 async def read_playback_session(
     user_id: str = Query(DEFAULT_USER_ID, min_length=1, max_length=128),
@@ -74,3 +81,19 @@ async def write_playback_session(req: PlaybackSessionRequest):
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/actions/{action_id}/ack")
+async def acknowledge_browser_action(action_id: str, req: PlayerActionAckRequest):
+    from services.player_action_store import acknowledge_player_action
+
+    action = acknowledge_player_action(
+        action_id,
+        user_id=req.user_id,
+        session_id=req.session_id,
+        status=req.status,
+        result=req.result,
+    )
+    if action is None:
+        raise HTTPException(status_code=404, detail="player action not found")
+    return action

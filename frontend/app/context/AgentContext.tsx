@@ -3,6 +3,7 @@
 import type { AgentState, ChatMessage, Track, TrackCardData } from "@/app/lib/types";
 import { useMode } from "@/app/context/ModeContext";
 import { usePlayer } from "@/app/context/PlayerContext";
+import { useScenario } from "@/app/context/ScenarioContext";
 import { useSSE } from "@/app/hooks/useSSE";
 import { apiUrl } from "@/app/lib/api";
 import {
@@ -188,6 +189,42 @@ function appendFromSdkPayload(
   return null;
 }
 
+function waitForAudioPlayback(
+  audio: HTMLAudioElement | null,
+  trigger: () => void | Promise<void>,
+  timeoutMs = 4000
+): Promise<void> {
+  if (!audio) return Promise.reject(new Error("播放器音频元素不可用"));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      audio.removeEventListener("playing", onPlaying);
+      audio.removeEventListener("error", onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onPlaying = () => finish();
+    const onError = () => finish(new Error("音频加载或播放失败"));
+    const timer = window.setTimeout(
+      () => finish(new Error("等待播放器开始播放超时")),
+      timeoutMs
+    );
+    audio.addEventListener("playing", onPlaying, { once: true });
+    audio.addEventListener("error", onError, { once: true });
+    void Promise.resolve()
+      .then(trigger)
+      .then(() => {
+        if (!audio.paused && Boolean(audio.currentSrc || audio.src)) finish();
+      })
+      .catch((error: unknown) =>
+        finish(error instanceof Error ? error : new Error(String(error)))
+      );
+  });
+}
+
 function toSpeechText(content: string): string {
   return content
     .replace(/```[\s\S]*?```/g, " ")
@@ -213,8 +250,13 @@ export function AgentProvider({
   const [userId, setUserId] = useState<string | null>(null);
   const streamingIdRef = useRef<string | null>(null);
 
-  const [currentScenario, setCurrentScenario] = useState("默认");
-  const [scenarios, setScenarios] = useState<string[]>([]);
+  const {
+    currentScenario,
+    setCurrentScenario,
+    scenarios,
+    addScenario,
+    deleteScenario,
+  } = useScenario();
   const [convertQueue, setConvertQueue] = useState<ConvertTrack[]>([]);
   const [convertingSet, setConvertingSet] = useState<Set<string>>(new Set());
   const [convertedSet, setConvertedSet] = useState<Set<string>>(new Set());
@@ -237,11 +279,13 @@ export function AgentProvider({
     setVolume,
     playTrack,
     playCollection,
+    addTracks,
     insertNext,
     removeSessionItem,
     reorderSession,
     clearSession,
     setPlaybackMode,
+    audioRef,
   } = usePlayer();
   const playerStateRef = useRef(playerState);
   useEffect(() => {
@@ -347,7 +391,7 @@ export function AgentProvider({
     setSessionId(getOrCreateId("musicer.session-id", "default"));
   }, []);
 
-  const executePlayerAction = useCallback((data: unknown) => {
+  const executePlayerAction = useCallback(async (data: unknown) => {
     if (!data || typeof data !== "object") return false;
     const actionData = data as Record<string, unknown>;
     if (actionData.type !== "client_action" || actionData.target !== "player") {
@@ -357,7 +401,7 @@ export function AgentProvider({
     const value = actionData.value;
     switch (actionData.action) {
       case "play":
-        void play();
+        await waitForAudioPlayback(audioRef.current, () => play());
         break;
       case "play_track": {
         const track = actionData.track;
@@ -370,7 +414,9 @@ export function AgentProvider({
         ) {
           return false;
         }
-        playTrack(candidate as Track);
+        await waitForAudioPlayback(audioRef.current, () => {
+          playTrack(candidate as Track);
+        });
         break;
       }
       case "play_collection": {
@@ -387,11 +433,13 @@ export function AgentProvider({
             )
         );
         if (!canonical.length) return false;
-        playCollection(
-          canonical,
-          actionData.origin_type === "playlist" ? "playlist" : "manual",
-          typeof actionData.origin_id === "string" ? actionData.origin_id : null
-        );
+        await waitForAudioPlayback(audioRef.current, () => {
+          playCollection(
+            canonical,
+            actionData.origin_type === "playlist" ? "playlist" : "manual",
+            typeof actionData.origin_id === "string" ? actionData.origin_id : null
+          );
+        });
         break;
       }
       case "insert_next": {
@@ -406,6 +454,27 @@ export function AgentProvider({
           return false;
         }
         insertNext(candidate as Track, "agent");
+        break;
+      }
+      case "add_tracks": {
+        const tracks = actionData.tracks;
+        if (!Array.isArray(tracks)) return false;
+        const canonical = tracks.filter(
+          (track): track is Track =>
+            Boolean(
+              track &&
+                typeof track === "object" &&
+                typeof (track as Partial<Track>).id === "string" &&
+                typeof (track as Partial<Track>).title === "string" &&
+                typeof (track as Partial<Track>).url === "string"
+            )
+        );
+        if (!canonical.length) return false;
+        addTracks(
+          canonical,
+          actionData.origin_type === "radio" ? "radio" : "recommendation",
+          typeof actionData.origin_id === "string" ? actionData.origin_id : null
+        );
         break;
       }
       case "remove_session_item":
@@ -468,7 +537,35 @@ export function AgentProvider({
         return false;
     }
     return true;
-  }, [clearSession, insertNext, pause, play, playCollection, playNext, playPrevious, playTrack, removeSessionItem, reorderSession, seek, setPlaybackMode, setVolume, stop]);
+  }, [addTracks, audioRef, clearSession, insertNext, pause, play, playCollection, playNext, playPrevious, playTrack, removeSessionItem, reorderSession, seek, setPlaybackMode, setVolume, stop]);
+
+  const acknowledgePlayerAction = useCallback(
+    async (
+      actionId: string,
+      status: "succeeded" | "failed",
+      result: Record<string, unknown>
+    ) => {
+      const response = await fetch(
+        apiUrl(`/api/playback-session/actions/${encodeURIComponent(actionId)}/ack`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id:
+              window.localStorage.getItem("musicer.user-id") ?? userId ?? "local",
+            session_id:
+              window.localStorage.getItem("musicer.session-id") ??
+              sessionId ??
+              "default",
+            status,
+            result,
+          }),
+        }
+      );
+      if (!response.ok) throw new Error(`播放器 ACK 提交失败：${response.status}`);
+    },
+    [sessionId, userId]
+  );
 
   const { send, loading, cancel: sseCancel } = useSSE({
     url: apiUrl(chatApiPath),
@@ -483,7 +580,29 @@ export function AgentProvider({
         return;
       }
       if (msg.event === "output") {
-        if (executePlayerAction(msg.data)) return;
+        if (msg.data && typeof msg.data === "object") {
+          const action = msg.data as Record<string, unknown>;
+          if (action.type === "client_action" && action.target === "player") {
+            const actionId = action.action_id;
+            if (typeof actionId !== "string" || !actionId) return;
+            void executePlayerAction(action)
+              .then((executed) => {
+                if (!executed) throw new Error("播放器拒绝了无效动作");
+                return acknowledgePlayerAction(actionId, "succeeded", {
+                  action: action.action,
+                  observed_at: new Date().toISOString(),
+                });
+              })
+              .catch((error: unknown) =>
+                acknowledgePlayerAction(actionId, "failed", {
+                  action: action.action,
+                  error: error instanceof Error ? error.message : String(error),
+                  observed_at: new Date().toISOString(),
+                }).catch(() => undefined)
+              );
+            return;
+          }
+        }
         if (msg.data && typeof msg.data === "object") {
           const payload = msg.data as Record<string, unknown>;
           if (payload.type === "track_cards" && payload.origin_tool === "convert_video") {
@@ -663,67 +782,6 @@ export function AgentProvider({
     };
     loadHistory();
   }, [userId, sessionId]);
-
-  // 加载场景列表
-  useEffect(() => {
-    const loadScenarios = async () => {
-      try {
-        const res = await fetch(apiUrl("/api/scenarios"));
-        if (res.ok) {
-          const data = await res.json();
-          if (data.scenarios && Array.isArray(data.scenarios)) {
-            setScenarios(data.scenarios);
-            setCurrentScenario((current) =>
-              data.scenarios.includes(current)
-                ? current
-                : data.scenarios[0] || "默认"
-            );
-          }
-        }
-      } catch {
-        // 加载失败使用默认值
-      }
-    };
-    loadScenarios();
-  }, []);
-
-  const addScenario = useCallback(async (name: string) => {
-    try {
-      const res = await fetch(apiUrl("/api/scenarios"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: name.trim() }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.scenarios && Array.isArray(data.scenarios)) {
-          setScenarios(data.scenarios);
-          setCurrentScenario(name.trim());
-        }
-      }
-    } catch {
-      // 添加失败
-    }
-  }, []);
-
-  const deleteScenario = useCallback(async (name: string) => {
-    try {
-      const res = await fetch(apiUrl(`/api/scenarios/${encodeURIComponent(name)}`), {
-        method: "DELETE",
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.scenarios) {
-          setScenarios(data.scenarios);
-          if (currentScenario === name) {
-            setCurrentScenario(data.scenarios[0] || "默认");
-          }
-        }
-      }
-    } catch {
-      // 删除失败不影响正常使用
-    }
-  }, [currentScenario]);
 
   const sendMessage = useCallback(
     async (text: string) => {

@@ -60,6 +60,8 @@ async def lifespan(app: FastAPI):
         init_playback_session_db()
         from services.music_library_store import init_music_library_db
         init_music_library_db()
+        from services.player_action_store import init_player_action_db
+        init_player_action_db()
     except Exception as e:
         logger.error(f"[startup] Playback session DB init failed: {e}")
 

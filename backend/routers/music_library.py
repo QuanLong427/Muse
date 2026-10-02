@@ -10,6 +10,7 @@ from services.music_library_store import (
     create_playlist,
     delete_playlist,
     get_playlist,
+    get_recommendation_batch,
     get_track_feedback_summary,
     list_playlists,
     list_recent_tracks,
@@ -59,12 +60,15 @@ class PlaybackEventRequest(BaseModel):
     duration_seconds: float = Field(default=0, ge=0)
     origin_type: str = Field(default="manual", max_length=64)
     origin_id: str | None = Field(default=None, max_length=256)
+    scenario: str = Field(default="默认", max_length=80)
 
 
 class RadioRecommendationRequest(BaseModel):
     user_id: str = DEFAULT_USER_ID
     exclude_track_ids: list[str] = Field(default_factory=list, max_length=5000)
     limit: int = Field(default=5, ge=1, le=20)
+    scenario: str = Field(default="默认", max_length=80)
+    current_track_id: str | None = Field(default=None, max_length=1024)
 
 
 class TrackFeedbackRequest(BaseModel):
@@ -232,7 +236,41 @@ async def recommend_radio(req: RadioRecommendationRequest):
         user_id=req.user_id,
         exclude_track_ids=req.exclude_track_ids,
         limit=req.limit,
+        scenario=req.scenario,
+        current_track_id=req.current_track_id,
     )
+
+
+@router.get("/api/recommendations/{batch_id}")
+async def read_recommendation_batch(
+    batch_id: str,
+    user_id: str = Query(DEFAULT_USER_ID, min_length=1, max_length=128),
+):
+    batch = get_recommendation_batch(batch_id, user_id=user_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="recommendation batch not found")
+    return batch
+
+
+@router.get("/api/preferences/recent")
+async def read_recent_preferences(
+    user_id: str = Query(DEFAULT_USER_ID, min_length=1, max_length=128),
+    window_days: int = Query(default=7),
+):
+    from services.preference_service import (
+        build_recent_preference_profile,
+        get_preference_window,
+    )
+
+    if window_days not in {7, 30}:
+        raise HTTPException(status_code=422, detail="window_days must be 7 or 30")
+    profile = build_recent_preference_profile(user_id)
+    return {
+        "user_id": profile["user_id"],
+        "generated_at": profile["generated_at"],
+        "policy_version": profile["policy_version"],
+        "window": get_preference_window(profile, window_days),
+    }
 
 
 @router.post("/api/track-feedback", status_code=201)

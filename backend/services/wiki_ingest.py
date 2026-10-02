@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Dict, List, Optional
 
 from config import settings
@@ -82,6 +82,11 @@ def _yaml_value(value) -> str:
 def _relative_audio_path(path: str) -> str:
     if not path:
         return ""
+    # pathlib interprets Windows drive paths as ordinary relative strings on
+    # Linux.  Raw Wiki records must remain portable regardless of which host
+    # produced the metadata.
+    if re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", path):
+        return PureWindowsPath(path).name
     try:
         return Path(path).resolve().relative_to(Path(settings.MUSIC_DIR).resolve()).as_posix()
     except (OSError, ValueError):

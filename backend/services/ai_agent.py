@@ -1,4 +1,6 @@
+import asyncio
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +16,12 @@ from typing_extensions import Annotated, TypedDict
 import logging
 
 from config import settings, PLATFORM_HINT, PROJECT_ROOT
-from services.agent_protocol import repair_instruction, validate_final_response
+from services.agent_protocol import (
+    dispatched_client_action_ids,
+    repair_instruction,
+    safe_protocol_response,
+    validate_final_response,
+)
 from services.llm_client import create_chat_model
 from services.skill_loader import discover_skills, load_skill, load_skill_resource
 from services.memory_manager import (
@@ -40,6 +47,78 @@ from services.memory_store import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _search_bilibili_with_retry(keyword: str, max_attempts: int = 2) -> dict[str, Any]:
+    """Return a structured Bilibili search result with bounded transient retry."""
+    import httpx
+    from services.bili_client import search_videos
+
+    normalized_keyword = keyword.strip()
+    if not normalized_keyword:
+        return {
+            "status": "error",
+            "error_code": "invalid_keyword",
+            "error": "搜索关键词不能为空",
+            "retryable": False,
+            "attempts": 0,
+            "total": 0,
+            "videos": [],
+        }
+
+    attempts = max(1, min(int(max_attempts), 2))
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async def _search():
+                async with httpx.AsyncClient(timeout=30) as client:
+                    return await search_videos(client, normalized_keyword)
+
+            result = asyncio.run(_search())
+            normalized_videos = []
+            for video in result.get("videos", []):
+                if hasattr(video, "model_dump"):
+                    video = video.model_dump(mode="json")
+                if isinstance(video, dict):
+                    normalized_videos.append(video)
+            return {
+                "status": "ok",
+                "attempts": attempt,
+                **result,
+                "videos": normalized_videos,
+            }
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = exc
+            if attempt < attempts:
+                continue
+            return {
+                "status": "error",
+                "error_code": "bilibili_transient_error",
+                "error": str(exc) or "B站搜索暂时不可用",
+                "retryable": True,
+                "attempts": attempt,
+                "total": 0,
+                "videos": [],
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error_code": "bilibili_search_failed",
+                "error": str(exc) or "B站搜索失败",
+                "retryable": False,
+                "attempts": attempt,
+                "total": 0,
+                "videos": [],
+            }
+    return {
+        "status": "error",
+        "error_code": "bilibili_search_failed",
+        "error": str(last_error or "B站搜索失败"),
+        "retryable": False,
+        "attempts": attempts,
+        "total": 0,
+        "videos": [],
+    }
 
 # ── System Prompts ──────────────────────────────────────────────────────────
 
@@ -207,6 +286,7 @@ def _extract_scenario_section(profile_text: str, scenario: str = "默认") -> st
 
 class AgentState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
+    client_action_results: dict[str, dict[str, Any]]
     protocol_status: str
     protocol_repairs: int
     protocol_issue: str
@@ -226,8 +306,33 @@ def _build_tools(
         "available": False,
         "reason": "播放器状态未由客户端提供",
     }
+
+    def dispatch_player_action(
+        client_action: dict[str, Any],
+        **result_fields: Any,
+    ) -> str:
+        """Register a browser command before exposing it to the SSE client."""
+        from services.player_action_store import issue_player_action
+
+        issued = issue_player_action(
+            user_id=user_id,
+            session_id=session_id,
+            payload=client_action,
+        )
+        return json.dumps(
+            {
+                "status": "dispatched",
+                "action_id": issued["id"],
+                **result_fields,
+                "client_action": issued["payload"],
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     track_registry: dict[str, dict[str, Any]] = {}
     download_authorized_bvids: set[str] = set()
+    activated_skills: set[str] = set()
     for selected in selected_tracks or []:
         if not isinstance(selected, dict):
             continue
@@ -248,6 +353,7 @@ def _build_tools(
         _, body = load_skill(name)
         if not body:
             return json.dumps({"error": "skill_load_failed", "name": name}, ensure_ascii=False)
+        activated_skills.add(name)
         return body
 
     @tool
@@ -424,13 +530,7 @@ def _build_tools(
         if value is not None:
             client_action["value"] = value
 
-        return json.dumps(
-            {
-                "status": "dispatched",
-                "client_action": client_action,
-            },
-            ensure_ascii=False,
-        )
+        return dispatch_player_action(client_action)
 
     @tool
     def play_track(track_id: str) -> str:
@@ -453,18 +553,15 @@ def _build_tools(
                 {"status": "not_found", "error": "本地曲库中不存在该 track_id", "track_id": track_id},
                 ensure_ascii=False,
             )
-        return json.dumps(
+        serialized_track = track.model_dump(mode="json")
+        return dispatch_player_action(
             {
-                "status": "dispatched",
-                "track": track.model_dump(mode="json"),
-                "client_action": {
-                    "target": "player",
-                    "action": "play_track",
-                    "track_id": track.id,
-                    "track": track.model_dump(mode="json"),
-                },
+                "target": "player",
+                "action": "play_track",
+                "track_id": track.id,
+                "track": serialized_track,
             },
-            ensure_ascii=False,
+            track=serialized_track,
         )
 
     @tool
@@ -530,20 +627,16 @@ def _build_tools(
                 tracks.append(track.model_dump(mode="json"))
         if not tracks:
             return json.dumps({"status": "empty", "error": "歌单中没有可播放的本地歌曲"}, ensure_ascii=False)
-        return json.dumps(
+        return dispatch_player_action(
             {
-                "status": "dispatched",
-                "playlist_id": playlist_id,
-                "missing_track_ids": missing,
-                "client_action": {
-                    "target": "player",
-                    "action": "play_collection",
-                    "tracks": tracks,
-                    "origin_type": "playlist",
-                    "origin_id": playlist_id,
-                },
+                "target": "player",
+                "action": "play_collection",
+                "tracks": tracks,
+                "origin_type": "playlist",
+                "origin_id": playlist_id,
             },
-            ensure_ascii=False,
+            playlist_id=playlist_id,
+            missing_track_ids=missing,
         )
 
     @tool
@@ -711,7 +804,7 @@ def _build_tools(
             client_action.update({"action": "reorder_session", "item_ids": requested})
         else:
             client_action["action"] = "clear_session"
-        return json.dumps({"status": "dispatched", "client_action": client_action}, ensure_ascii=False)
+        return dispatch_player_action(client_action)
 
     @tool
     def set_playback_mode(
@@ -726,17 +819,13 @@ def _build_tools(
             return json.dumps({"status": "unavailable", "error": "当前请求没有可控制的浏览器播放器"}, ensure_ascii=False)
         if order_mode is None and repeat_mode is None:
             return json.dumps({"status": "invalid", "error": "至少提供一种模式"}, ensure_ascii=False)
-        return json.dumps(
+        return dispatch_player_action(
             {
-                "status": "dispatched",
-                "client_action": {
-                    "target": "player",
-                    "action": "set_playback_mode",
-                    "order_mode": order_mode,
-                    "repeat_mode": repeat_mode,
-                },
-            },
-            ensure_ascii=False,
+                "target": "player",
+                "action": "set_playback_mode",
+                "order_mode": order_mode,
+                "repeat_mode": repeat_mode,
+            }
         )
 
     @tool
@@ -772,6 +861,223 @@ def _build_tools(
         return json.dumps({"status": "recorded", "feedback": event}, ensure_ascii=False)
 
     @tool
+    def get_recent_music_preferences(window_days: Literal[7, 30] = 7) -> str:
+        """Read the deterministic short-term music preference projection.
+
+        The result is derived from playback and explicit-feedback events. It
+        is not a permanent memory and must not be described as one.
+        """
+        from services.preference_service import (
+            build_recent_preference_profile,
+            get_preference_window,
+        )
+
+        profile = build_recent_preference_profile(user_id, scenario=scenario)
+        return json.dumps(
+            {
+                "status": "ok",
+                "generated_at": profile["generated_at"],
+                "policy_version": profile["policy_version"],
+                "window": get_preference_window(profile, window_days),
+            },
+            ensure_ascii=False,
+        )
+
+    @tool
+    def recommend_next(limit: int = 5) -> str:
+        """Rank and append the next local Radio candidates.
+
+        This uses the current PlaybackSession, recent 7-day preferences and
+        explicit feedback. It never downloads or changes named playlists.
+        """
+        if not player_snapshot.get("available", False):
+            return json.dumps(
+                {"status": "unavailable", "error": "当前请求没有可控制的浏览器播放器"},
+                ensure_ascii=False,
+            )
+        current_items = [
+            item for item in player_snapshot.get("items", []) if isinstance(item, dict)
+        ]
+        exclude_track_ids = [
+            str(item.get("track", {}).get("id") or "")
+            for item in current_items
+            if isinstance(item.get("track"), dict)
+        ]
+        current = player_snapshot.get("current")
+        current_track_id = (
+            str(current.get("id") or "") if isinstance(current, dict) else ""
+        )
+        from services.recommendation_service import recommend_local_radio_tracks
+
+        result = recommend_local_radio_tracks(
+            user_id=user_id,
+            exclude_track_ids=exclude_track_ids,
+            limit=max(1, min(int(limit), 20)),
+            scenario=scenario,
+            current_track_id=current_track_id or None,
+        )
+        tracks = result.get("tracks") or []
+        if not tracks:
+            return json.dumps(
+                {"status": "empty", **result}, ensure_ascii=False, default=str
+            )
+        return dispatch_player_action(
+            {
+                "target": "player",
+                "action": "add_tracks",
+                "tracks": tracks,
+                "origin_type": "radio",
+                "origin_id": result.get("batch_id"),
+            },
+            **result,
+        )
+
+    @tool
+    def explain_recommendation(batch_id: str, track_id: str = "") -> str:
+        """Return the persisted evidence for a real recommendation batch.
+
+        Use a batch_id previously returned by Radio/recommend_next. Never
+        invent reasons for a batch that does not exist.
+        """
+        from services.music_library_store import get_recommendation_batch
+
+        batch = get_recommendation_batch(batch_id, user_id=user_id)
+        if batch is None:
+            return json.dumps(
+                {"status": "not_found", "error": "推荐批次不存在"},
+                ensure_ascii=False,
+            )
+        if track_id:
+            item = next(
+                (candidate for candidate in batch["items"] if candidate["track_id"] == track_id),
+                None,
+            )
+            if item is None:
+                return json.dumps(
+                    {"status": "not_found", "error": "该歌曲不在推荐批次中"},
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "batch_id": batch_id,
+                    "scenario": batch["scenario"],
+                    "created_at": batch["created_at"],
+                    "item": item,
+                    "constraints": batch["constraints"],
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"status": "ok", "batch": batch}, ensure_ascii=False)
+
+    @tool
+    def recommend_music(
+        count: int = 4,
+        source_policy: Literal["balanced", "local", "cloud"] = "balanced",
+        query: str = "",
+        artist: str = "",
+        genre: str = "",
+        seed_songs: str = "",
+    ) -> str:
+        """Build a read-only, auditable conversational music recommendation.
+
+        Use this for requests to recommend or discover songs.  Unless the user
+        explicitly requests a source, ``balanced`` plans 50% local and 50%
+        Bilibili candidates, then dynamically reallocates unavailable slots.
+        The result includes exact ``track_ids``; pass those ids to
+        ``present_tracks`` instead of inventing cards.  This tool never starts
+        playback, downloads media, or changes a playlist. ``seed_songs`` is a
+        comma-separated string of discovery hints; returned local/Bilibili
+        records are the evidence.
+        """
+        from services.recommendation_service import recommend_conversational_tracks
+
+        if "music-recommendation" not in activated_skills:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "skill_activation_required",
+                    "required_skill": "music-recommendation",
+                    "retryable": True,
+                    "error": "请先加载 music-recommendation Skill，再重试推荐。",
+                },
+                ensure_ascii=False,
+            )
+
+        raw_seed_songs: Any = seed_songs
+        if isinstance(seed_songs, str) and seed_songs.strip().startswith("["):
+            try:
+                decoded_seed_songs = json.loads(seed_songs)
+                if isinstance(decoded_seed_songs, list):
+                    raw_seed_songs = decoded_seed_songs
+            except json.JSONDecodeError:
+                pass
+        if isinstance(raw_seed_songs, str):
+            raw_seed_songs = re.split(r"[,，、;；\n]+", raw_seed_songs)
+        normalized_seed_songs = list(
+            dict.fromkeys(
+                str(song).strip()
+                for song in raw_seed_songs
+                if str(song).strip()
+            )
+        )[:12]
+        if source_policy != "local" and (artist.strip() or genre.strip()) and not normalized_seed_songs:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "recommendation_seeds_required",
+                    "retryable": True,
+                    "error": (
+                        "歌手或流派的云端推荐需要 2-8 个具体歌曲名作为检索种子；"
+                        "请根据已加载 Skill、LLM-Wiki 或模型知识补充 seed_songs 后重试。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        result = recommend_conversational_tracks(
+            user_id=user_id,
+            scenario=scenario,
+            count=count,
+            source_policy=source_policy,
+            query=query,
+            artist=artist,
+            genre=genre,
+            seed_songs=normalized_seed_songs,
+            cloud_search=_search_bilibili_with_retry if source_policy != "local" else None,
+        )
+        for item in result.get("recommendations", []):
+            if not isinstance(item, dict):
+                continue
+            raw_track = item.get("track")
+            if not isinstance(raw_track, dict):
+                continue
+            track_id = str(raw_track.get("id") or "")
+            if track_id.startswith("bilibili:"):
+                continue
+            try:
+                from models import Track
+
+                card = local_track_card(Track.model_validate(raw_track))
+            except (TypeError, ValueError):
+                continue
+            serialized = card.model_dump(mode="json")
+            track_registry[card.track_id] = serialized
+            if card.bvid:
+                track_registry[card.bvid] = serialized
+        for video in result.get("videos", []):
+            if not isinstance(video, dict):
+                continue
+            card = remote_track_card(video)
+            if card is None:
+                continue
+            serialized = card.model_dump(mode="json")
+            track_registry[card.track_id] = serialized
+            if card.bvid:
+                track_registry[card.bvid] = serialized
+        return json.dumps(result, ensure_ascii=False, default=str)
+
+    @tool
     def bili_search(keyword: str) -> str:
         """Search Bilibili for videos by a specific keyword.
 
@@ -780,15 +1086,7 @@ def _build_tools(
         single-song version; do not use broad 'popular songs' queries as if a
         long compilation were an individual track.
         """
-        import asyncio
-        import httpx
-        from services.bili_client import search_videos
-
-        async def _search():
-            async with httpx.AsyncClient(timeout=30) as client:
-                return await search_videos(client, keyword)
-
-        result = asyncio.run(_search())
+        result = _search_bilibili_with_retry(keyword)
         if isinstance(result, dict):
             normalized_videos = []
             for video in result.get("videos", []):
@@ -1095,6 +1393,10 @@ def _build_tools(
         manage_playback_session,
         set_playback_mode,
         record_track_feedback,
+        get_recent_music_preferences,
+        recommend_next,
+        recommend_music,
+        explain_recommendation,
         bili_search,
         local_search,
         present_tracks,
@@ -1138,10 +1440,45 @@ def _build_agent(
         """Agent node: call LLM with tools."""
         messages = state["messages"]
         full_messages = [SystemMessage(content=system_prompt)] + list(messages)
+        action_results = state.get("client_action_results", {})
+        if action_results:
+            receipts = [
+                {
+                    "action_id": action_id,
+                    "action": result.get("action"),
+                    "status": result.get("status"),
+                    "result": result.get("result", {}),
+                }
+                for action_id, result in action_results.items()
+            ]
+            full_messages.append(
+                SystemMessage(
+                    content=(
+                        "以下是发起本轮对话的浏览器返回的真实播放器 ACK。"
+                        "只有 status=succeeded 才能声称动作执行成功；status=failed 必须说明失败：\n"
+                        + json.dumps(receipts, ensure_ascii=False, default=str)
+                    )
+                )
+            )
         response = llm_with_tools.invoke(full_messages)
         return {"messages": [response]}
 
     tool_node = ToolNode(tools)
+
+    async def await_client_actions(state: AgentState) -> dict:
+        """Yield the event loop while the initiating browser executes commands."""
+        action_ids = dispatched_client_action_ids(state["messages"])
+        if not action_ids:
+            return {"client_action_results": {}}
+        from services.player_action_store import wait_for_player_actions
+
+        results = await asyncio.to_thread(
+            wait_for_player_actions,
+            action_ids,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return {"client_action_results": results}
 
     def should_continue(state: AgentState) -> str:
         """Run real tool calls; otherwise validate the proposed final answer."""
@@ -1150,12 +1487,31 @@ def _build_agent(
             return "tools"
         return "validate"
 
-    def validate_node(state: AgentState) -> dict:
+    async def validate_node(state: AgentState) -> dict:
         last_message = state["messages"][-1]
         text = last_message.content if isinstance(last_message, AIMessage) else ""
         if not isinstance(text, str):
             text = str(text or "")
-        violation = validate_final_response(text, state["messages"], registered_tool_names)
+        action_ids = dispatched_client_action_ids(state["messages"])
+        action_results = state.get("client_action_results", {})
+        if action_ids and any(
+            action_results.get(action_id, {}).get("status") not in {"succeeded", "failed"}
+            for action_id in action_ids
+        ):
+            from services.player_action_store import wait_for_player_actions
+
+            action_results = await asyncio.to_thread(
+                wait_for_player_actions,
+                action_ids,
+                user_id=user_id,
+                session_id=session_id,
+            )
+        violation = validate_final_response(
+            text,
+            state["messages"],
+            registered_tool_names,
+            client_action_results=action_results,
+        )
         if violation is None:
             return {"protocol_status": "valid", "protocol_issue": ""}
 
@@ -1175,13 +1531,14 @@ def _build_agent(
         return {
             "messages": [
                 AIMessage(
-                    content=(
-                        "本轮未能生成可验证的执行结果。为避免展示未执行的命令或虚构状态，"
-                        "我已停止本次操作，请重新描述目标后再试。"
+                    content=safe_protocol_response(
+                        violation,
+                        state["messages"],
+                        client_action_results=action_results,
                     )
                 )
             ],
-            "protocol_status": "blocked",
+            "protocol_status": "recovered",
             "protocol_issue": violation.code,
         }
 
@@ -1191,12 +1548,14 @@ def _build_agent(
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tool_node)
+    graph.add_node("await_client_actions", await_client_actions)
     graph.add_node("validate", validate_node)
     graph.set_entry_point("agent")
     graph.add_conditional_edges(
         "agent", should_continue, {"tools": "tools", "validate": "validate"}
     )
-    graph.add_edge("tools", "agent")
+    graph.add_edge("tools", "await_client_actions")
+    graph.add_edge("await_client_actions", "agent")
     graph.add_conditional_edges(
         "validate", after_validation, {"agent": "agent", END: END}
     )
@@ -1444,16 +1803,15 @@ async def chat_stream(
                     episode_message_ids.append(tool_message_id)
                 except Exception:
                     logger.exception("[memory] failed to persist tool result")
-                if tool_name in {"control_player", "play_track", "play_music_playlist"}:
-                    client_action = _extract_client_action(tool_output)
-                    if client_action:
-                        yield {
-                            "event": "output",
-                            "data": {
-                                "type": "client_action",
-                                **client_action,
-                            },
-                        }
+                client_action = _extract_client_action(tool_output)
+                if client_action:
+                    yield {
+                        "event": "output",
+                        "data": {
+                            "type": "client_action",
+                            **client_action,
+                        },
+                    }
                 cards = track_cards_from_tool_result(tool_name, tool_output)
                 if cards:
                     known_ids = {card.get("track_id") for card in presented_track_cards}

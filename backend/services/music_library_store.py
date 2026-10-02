@@ -6,6 +6,7 @@ Neither table owns or mutates the active PlaybackSession.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -36,6 +37,18 @@ def _get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _ensure_music_library_columns(conn: sqlite3.Connection) -> None:
+    """Apply additive migrations for existing single-user databases."""
+    playback_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(playback_events)").fetchall()
+    }
+    if "scenario" not in playback_columns:
+        conn.execute(
+            "ALTER TABLE playback_events ADD COLUMN scenario TEXT NOT NULL DEFAULT '默认'"
+        )
 
 
 def init_music_library_db() -> None:
@@ -98,6 +111,7 @@ def init_music_library_db() -> None:
                 duration_seconds REAL NOT NULL DEFAULT 0,
                 origin_type TEXT NOT NULL DEFAULT 'manual',
                 origin_id TEXT,
+                scenario TEXT NOT NULL DEFAULT '默认',
                 occurred_at TEXT NOT NULL
             );
 
@@ -119,8 +133,39 @@ def init_music_library_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_track_feedback_user_track_time
             ON track_feedback_events(user_id, track_id, occurred_at DESC);
+
+            CREATE TABLE IF NOT EXISTS recommendation_batches (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                scenario TEXT NOT NULL DEFAULT '默认',
+                current_track_id TEXT,
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                constraints_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_recommendation_batches_user_time
+            ON recommendation_batches(user_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS recommendation_batch_items (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                track_id TEXT NOT NULL,
+                score REAL NOT NULL,
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                track_json TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES recommendation_batches(id) ON DELETE CASCADE,
+                UNIQUE (batch_id, position),
+                UNIQUE (batch_id, track_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_recommendation_items_batch_position
+            ON recommendation_batch_items(batch_id, position);
             """
         )
+        _ensure_music_library_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -465,6 +510,7 @@ def record_playback_event(
     duration_seconds: float,
     origin_type: str,
     origin_id: str | None,
+    scenario: str = "默认",
 ) -> dict[str, Any]:
     track_id = str(track.get("id") or "").strip()
     if not track_id:
@@ -479,8 +525,8 @@ def record_playback_event(
             INSERT INTO playback_events (
                 id, user_id, session_id, item_id, event_type,
                 track_id, title, author, url, filename, bvid, sub_dir, size, date,
-                position_seconds, duration_seconds, origin_type, origin_id, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                position_seconds, duration_seconds, origin_type, origin_id, scenario, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
@@ -501,6 +547,7 @@ def record_playback_event(
                 max(0.0, float(duration_seconds)),
                 origin_type or "manual",
                 origin_id,
+                scenario.strip()[:80] or "默认",
                 occurred_at,
             ),
         )
@@ -667,5 +714,157 @@ def list_feedback_excluded_track_ids(user_id: str = DEFAULT_USER_ID) -> set[str]
                 if (now - occurred).total_seconds() < 24 * 60 * 60:
                     excluded.add(track_id)
         return excluded
+    finally:
+        conn.close()
+
+
+def list_playback_events_since(
+    *, user_id: str = DEFAULT_USER_ID, since: str
+) -> list[dict[str, Any]]:
+    """Return immutable playback evidence at or after an ISO timestamp."""
+    init_music_library_db()
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM playback_events
+            WHERE user_id = ? AND occurred_at >= ?
+            ORDER BY occurred_at ASC, id ASC
+            """,
+            (user_id.strip() or DEFAULT_USER_ID, since),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_track_feedback_events_since(
+    *, user_id: str = DEFAULT_USER_ID, since: str
+) -> list[dict[str, Any]]:
+    """Return immutable explicit-feedback evidence at or after an ISO timestamp."""
+    init_music_library_db()
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM track_feedback_events
+            WHERE user_id = ? AND occurred_at >= ?
+            ORDER BY occurred_at ASC, id ASC
+            """,
+            (user_id.strip() or DEFAULT_USER_ID, since),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_recommendation_batch(
+    *,
+    user_id: str,
+    kind: str,
+    scenario: str,
+    current_track_id: str | None,
+    profile_snapshot: dict[str, Any],
+    constraints: dict[str, Any],
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist one immutable recommendation decision and its ranked items."""
+    if not items:
+        raise ValueError("recommendation batch requires at least one item")
+    init_music_library_db()
+    batch_id = str(uuid4())
+    created_at = _now()
+    normalized_user = user_id.strip() or DEFAULT_USER_ID
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO recommendation_batches(
+                id, user_id, kind, scenario, current_track_id,
+                profile_json, constraints_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                normalized_user,
+                kind.strip() or "radio",
+                scenario.strip()[:80] or "默认",
+                current_track_id or None,
+                json.dumps(profile_snapshot, ensure_ascii=False),
+                json.dumps(constraints, ensure_ascii=False),
+                created_at,
+            ),
+        )
+        for position, item in enumerate(items):
+            track = item.get("track")
+            if not isinstance(track, dict) or not str(track.get("id") or "").strip():
+                raise ValueError("recommendation item requires track.id")
+            conn.execute(
+                """
+                INSERT INTO recommendation_batch_items(
+                    id, batch_id, position, track_id, score, reasons_json, track_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    batch_id,
+                    position,
+                    str(track["id"]),
+                    float(item.get("score") or 0.0),
+                    json.dumps(item.get("reasons") or [], ensure_ascii=False),
+                    json.dumps(track, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    batch = get_recommendation_batch(batch_id, user_id=normalized_user)
+    assert batch is not None
+    return batch
+
+
+def get_recommendation_batch(
+    batch_id: str, *, user_id: str = DEFAULT_USER_ID
+) -> dict[str, Any] | None:
+    init_music_library_db()
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM recommendation_batches WHERE id = ? AND user_id = ?",
+            (batch_id, user_id.strip() or DEFAULT_USER_ID),
+        ).fetchone()
+        if row is None:
+            return None
+        items = conn.execute(
+            """
+            SELECT * FROM recommendation_batch_items
+            WHERE batch_id = ? ORDER BY position ASC
+            """,
+            (batch_id,),
+        ).fetchall()
+        return {
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "kind": str(row["kind"]),
+            "scenario": str(row["scenario"]),
+            "current_track_id": row["current_track_id"],
+            "profile": json.loads(row["profile_json"] or "{}"),
+            "constraints": json.loads(row["constraints_json"] or "{}"),
+            "created_at": str(row["created_at"]),
+            "items": [
+                {
+                    "position": int(item["position"]),
+                    "track_id": str(item["track_id"]),
+                    "score": float(item["score"]),
+                    "reasons": json.loads(item["reasons_json"] or "[]"),
+                    "track": json.loads(item["track_json"]),
+                }
+                for item in items
+            ],
+        }
     finally:
         conn.close()

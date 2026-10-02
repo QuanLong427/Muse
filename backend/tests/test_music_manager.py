@@ -3,7 +3,8 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from services.music_manager import parse_name
+from models import Track
+from services.music_manager import parse_name, search_tracks
 
 
 def test_parse_name_full_format():
@@ -85,3 +86,38 @@ def test_parse_name_legacy_double_dash_before_bvid():
     assert result["title"] == "晴天"
     assert result["author"] == "周杰伦"
     assert result["bvid"] == "BV1xx411c7mD"
+
+
+def test_search_tracks_matches_title_and_artist_tokens(monkeypatch):
+    tracks = [
+        Track(
+            id="music/longest.mp3",
+            title="《最长的电影》",
+            author="周杰伦",
+            date="",
+            filename="周杰伦-《最长的电影》-BV1.mp3",
+            subDir="music",
+            size=1,
+            url="/api/tracks/music/longest.mp3",
+            bvid="BV1",
+        ),
+        Track(
+            id="music/yellow.mp3",
+            title="Yellow",
+            author="Coldplay",
+            date="",
+            filename="Coldplay-Yellow-BV2.mp3",
+            subDir="music",
+            size=1,
+            url="/api/tracks/music/yellow.mp3",
+            bvid="BV2",
+        ),
+    ]
+    monkeypatch.setattr("services.music_manager.scan_tracks", lambda: tracks)
+
+    assert [track.id for track in search_tracks("最长的电影 周杰伦")] == [
+        "music/longest.mp3"
+    ]
+    assert [track.id for track in search_tracks("coldplay yellow")] == [
+        "music/yellow.mp3"
+    ]
