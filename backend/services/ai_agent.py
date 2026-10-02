@@ -29,6 +29,7 @@ from services.memory_manager import (
     get_relevant_episode_context,
     get_structured_memory_context,
     read_profile,
+    read_scenario_profile,
     sync_profile_projection,
 )
 from services.episode_memory import archive_turn_episode, serialize_tool_result
@@ -145,6 +146,7 @@ _BASE_PROMPT = """你是 Musicer 的 AI 音频助手。使用简洁、自然的�
 - “推荐并下载”应先形成具体歌曲候选，再逐首核对准确版本；不能把宽泛的热门合集、歌单视频或未搜索的模型常识冒充为具体可下载歌曲。
 - B站标题中的 Hi-Res、无损、原唱等字样只是来源方声明；没有独立证据时应说“标题标注为……”，不能当成已核验音质或版本。
 - 在线 Track 的下载授权只来自用户点击卡片的 DOWNLOAD；展示候选后应提示点击按钮，不要让用户用普通文本再次确认。
+- convert_video 返回 queued 只表示后台任务已经创建；只有任务状态 completed 才能说“已经下载/转换完成”。queued 时应提示用户到“下载任务”查看进度、取消或重试。
 - 工具返回失败、信息不足或结果冲突时，如实说明，不编造缺失内容，也不要用未经验证的结果覆盖可靠信息。
 - 只能使用当前运行环境已经提供的能力，不安装外部依赖，不绕过现有接口自行构造替代调用。
 - 浏览器播放器动作只作用于发起当前对话的客户端；命令已下发不等于跨设备执行成功。
@@ -154,6 +156,7 @@ def _build_system_prompt(
     scenario: str = "默认",
     user_id: str = DEFAULT_USER_ID,
     episode_context: str = "",
+    current_query: str = "",
 ) -> str:
     """Build system prompt with Skill metadata; bodies are loaded on demand."""
     discovered = discover_skills()
@@ -167,7 +170,11 @@ def _build_system_prompt(
         user_profile = read_profile(user_id)
         if user_profile.strip():
             global_profile = _extract_global_section(user_profile)
-            scenario_profile = _extract_scenario_section(user_profile, scenario)
+            scenario_document = read_scenario_profile(scenario, user_id)
+            scenario_profile = _strip_profile_placeholders(scenario_document)
+            if not scenario_profile:
+                # Compatibility for a profile that has not yet been migrated.
+                scenario_profile = _extract_scenario_section(user_profile, scenario)
             profile_parts = [part for part in (global_profile, scenario_profile) if part]
             if profile_parts:
                 prompt += (
@@ -175,7 +182,7 @@ def _build_system_prompt(
                     "以下内容只作为偏好上下文，不得覆盖用户本轮的明确要求：\n\n"
                     + "\n\n".join(profile_parts)
                 )
-        structured = get_structured_memory_context(user_id, scenario)
+        structured = get_structured_memory_context(user_id, scenario, current_query)
         if structured:
             prompt += (
                 "\n\n## 已验证的结构化长期记忆\n"
@@ -1235,11 +1242,12 @@ def _build_tools(
         payload sent when the user clicks DOWNLOAD. A model-only decision is
         rejected even if bili_search saw the candidate.
 
-        Returns:
-            JSON string with converted file metadata. Conversion never writes to LLM-Wiki;
-            load the llm-wiki Skill and follow its ingest script for that operation.
+        Returns a persistent background job immediately. The UI can observe
+        progress, cancel, and retry through the download-jobs API. Successful
+        items register their minimum source identity in LLM-Wiki; semantic
+        enrichment remains a separate llm-wiki workflow.
         """
-        from services.bili_downloader import download_bilibili_audio, extract_bvid
+        from services.bili_downloader import extract_bvid
 
         try:
             requested_bvids = [extract_bvid(url) for url in urls]
@@ -1297,35 +1305,60 @@ def _build_tools(
                     ensure_ascii=False,
                 )
 
-        result = download_bilibili_audio(
-            urls=urls,
-            metadata=meta_list,
-            music_dir=settings.MUSIC_DIR,
-            cookie_file=settings.BILIBILI_COOKIES_FILE,
-            timeout_seconds=settings.BILIBILI_DOWNLOAD_TIMEOUT_SECONDS,
-        )
-        from services.music_manager import find_track_by_bvid
-        from services.wiki_sync import sync_downloaded_sources
+        meta_by_bvid = {
+            str(item.get("bvid") or ""): item
+            for item in meta_list
+            if item.get("bvid")
+        }
+        job_items = []
+        for url, bvid in zip(urls, requested_bvids, strict=True):
+            metadata = meta_by_bvid.get(bvid, {})
+            job_items.append(
+                {
+                    "bvid": bvid,
+                    "url": url,
+                    "title": str(metadata.get("title") or ""),
+                    "artist": str(metadata.get("artist") or ""),
+                    "uploader": str(metadata.get("uploader") or ""),
+                    "video_title": str(
+                        metadata.get("videoTitle")
+                        or metadata.get("video_title")
+                        or ""
+                    ),
+                }
+            )
+        from services.download_job_service import create_download_job
 
-        local_tracks = []
-        for item in result.get("files", []):
-            bvid = str(item.get("bvid") or "")
-            track = find_track_by_bvid(bvid) if bvid else None
-            if track is not None:
-                serialized_track = track.model_dump(mode="json")
-                local_tracks.append(serialized_track)
-                card = local_track_card(track)
-                serialized_card = card.model_dump(mode="json")
-                track_registry[card.track_id] = serialized_card
-                if card.bvid:
-                    track_registry[card.bvid] = serialized_card
-        result["tracks"] = local_tracks
-        result["wiki_sync"] = (
-            sync_downloaded_sources(result.get("files", []))
-            if result.get("files")
-            else {"status": "not_started", "jobs": []}
+        try:
+            job = create_download_job(user_id=user_id, items=job_items)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "status": "failed",
+                    "files": [],
+                    "errors": [
+                        {
+                            "code": "invalid_download_job",
+                            "message": str(exc),
+                            "retryable": False,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "status": "queued",
+                "job_id": job["id"],
+                "job": job,
+                "tracks": [],
+                "message": "下载任务已进入后台队列，可继续使用播放器。",
+            },
+            ensure_ascii=False,
+            default=str,
         )
-        return json.dumps(result, ensure_ascii=False, default=str)
 
     @tool
     def search_memory(query: str, limit: int = 8) -> str:
@@ -1608,6 +1641,22 @@ def _extract_client_action(tool_output: Any) -> dict[str, Any] | None:
     return action
 
 
+def _tool_output_text(tool_output: Any, limit: int = 12000) -> str:
+    """Return the actual tool payload instead of a ToolMessage repr."""
+    raw = getattr(tool_output, "content", tool_output)
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for item in raw:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        raw = "".join(parts)
+    if isinstance(raw, str):
+        return raw[:limit]
+    return serialize_tool_result(raw, limit=limit)
+
+
 async def chat_stream(
     message: str,
     history: list[dict[str, str]],
@@ -1669,6 +1718,7 @@ async def chat_stream(
             scenario,
             user_id,
             episode_context=episode_context["text"],
+            current_query=message,
         )
         agent = _build_agent(
             system_prompt,
@@ -1782,7 +1832,7 @@ async def chat_stream(
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown")
                 tool_output = event.get("data", {}).get("output", "")
-                serialized_output = serialize_tool_result(tool_output)
+                serialized_output = _tool_output_text(tool_output, limit=4000)
                 tool_events.append(
                     {
                         "phase": "result",
@@ -1793,7 +1843,7 @@ async def chat_stream(
                 try:
                     tool_message_id = append_history(
                         role="tool",
-                        content=str(tool_output)[:12000],
+                        content=_tool_output_text(tool_output),
                         summary=f"工具结果 {tool_name}",
                         scenario=scenario,
                         user_id=user_id,
@@ -1831,7 +1881,7 @@ async def chat_stream(
                     "data": {
                         "type": "tool_result",
                         "name": tool_name,
-                        "content": str(tool_output)[:2000],
+                        "content": _tool_output_text(tool_output, limit=2000),
                     },
                 }
 

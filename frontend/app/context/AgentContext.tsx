@@ -1,6 +1,7 @@
 "use client";
 
-import type { AgentState, ChatMessage, Track, TrackCardData } from "@/app/lib/types";
+import type { AgentState, ChatMessage, DownloadJob, Track, TrackCardData } from "@/app/lib/types";
+import { useDownloads } from "@/app/context/DownloadContext";
 import { useMode } from "@/app/context/ModeContext";
 import { usePlayer } from "@/app/context/PlayerContext";
 import { useScenario } from "@/app/context/ScenarioContext";
@@ -17,16 +18,10 @@ import {
   type ReactNode,
 } from "react";
 
-export type ConvertTrack = { bvid: string; title?: string; author?: string };
-
 type AgentCtxValue = AgentState & {
   sendMessage: (text: string) => Promise<void>;
   clearMessages: () => void;
-  queueConvert: (tracks: ConvertTrack[]) => void;
   cancel: () => void;
-  convertQueue: ConvertTrack[];
-  convertingSet: Set<string>;
-  convertedSet: Set<string>;
   currentScenario: string;
   setCurrentScenario: (s: string) => void;
   scenarios: string[];
@@ -257,9 +252,7 @@ export function AgentProvider({
     addScenario,
     deleteScenario,
   } = useScenario();
-  const [convertQueue, setConvertQueue] = useState<ConvertTrack[]>([]);
-  const [convertingSet, setConvertingSet] = useState<Set<string>>(new Set());
-  const [convertedSet, setConvertedSet] = useState<Set<string>>(new Set());
+  const { registerJob } = useDownloads();
   const [voiceOutputEnabled, setVoiceOutputEnabled] = useState(false);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
   const [voiceOutputError, setVoiceOutputError] = useState("");
@@ -605,21 +598,18 @@ export function AgentProvider({
         }
         if (msg.data && typeof msg.data === "object") {
           const payload = msg.data as Record<string, unknown>;
-          if (payload.type === "track_cards" && payload.origin_tool === "convert_video") {
-            const cards = Array.isArray(payload.tracks) ? payload.tracks : [];
-            const completedBvids = cards
-              .map((card) =>
-                card && typeof card === "object"
-                  ? (card as Record<string, unknown>).bvid
-                  : null
-              )
-              .filter((bvid): bvid is string => typeof bvid === "string" && Boolean(bvid));
-            if (completedBvids.length) {
-              setConvertedSet((previous) => {
-                const next = new Set(previous);
-                completedBvids.forEach((bvid) => next.add(bvid));
-                return next;
-              });
+          if (
+            payload.type === "tool_result" &&
+            payload.name === "convert_video" &&
+            typeof payload.content === "string"
+          ) {
+            try {
+              const result = JSON.parse(payload.content) as Record<string, unknown>;
+              if (result.job && typeof result.job === "object") {
+                registerJob(result.job as DownloadJob);
+              }
+            } catch {
+              // The visible tool message still exposes malformed results for diagnosis.
             }
           }
         }
@@ -645,86 +635,9 @@ export function AgentProvider({
     },
   });
 
-  const loadingRef = useRef(loading);
-  const convertQueueRef = useRef(convertQueue);
-  useEffect(() => {
-    loadingRef.current = loading;
-  }, [loading]);
-  useEffect(() => {
-    convertQueueRef.current = convertQueue;
-  }, [convertQueue]);
-
-  const flush = useCallback(() => {
-    const queue = convertQueueRef.current;
-    if (!queue.length) return;
-
-    setConvertQueue([]);
-    setConvertingSet((prev) => {
-      const next = new Set(prev);
-      for (const t of queue) next.add(t.bvid);
-      return next;
-    });
-
-    const items = queue.map((t) => ({
-      url: `https://www.bilibili.com/video/${t.bvid}`,
-      title: t.title || "",
-      artist: t.author || "",
-      bvid: t.bvid,
-    }));
-    const msg = `请将以下B站视频转为音频并保存到本地曲库，不要自动加入当前播放会话:\n${JSON.stringify(items)}`;
-    send(msg, {
-      user_id: userId ?? "local",
-      session_id: sessionId ?? "default",
-      scenario: currentScenario,
-      selected_tracks: items.map((item) => ({
-        bvid: item.bvid,
-        title: item.title,
-        author: item.artist,
-        duration: "",
-        url: item.url,
-      })),
-    });
-  }, [send, userId, sessionId, currentScenario]);
-
-  const queueConvert = useCallback(
-    (tracks: ConvertTrack[]) => {
-      setConvertQueue((prev) => {
-        const existing = new Set([
-          ...prev.map((t) => t.bvid),
-          ...Array.from(convertingSet),
-          ...Array.from(convertedSet),
-        ]);
-        const fresh = tracks.filter((t) => !existing.has(t.bvid));
-        if (!fresh.length) return prev;
-        return [...prev, ...fresh];
-      });
-
-      if (!loadingRef.current) {
-        setTimeout(() => flush(), 0);
-      }
-    },
-    [convertingSet, convertedSet, flush]
-  );
-
   const cancel = useCallback(() => {
     sseCancel();
-    setConvertQueue([]);
-    setConvertingSet(new Set());
   }, [sseCancel]);
-
-  const prevLoadingRef = useRef(loading);
-  useEffect(() => {
-    const wasLoading = prevLoadingRef.current;
-    prevLoadingRef.current = loading;
-
-    if (wasLoading && !loading) {
-      setConvertingSet(() => new Set());
-
-      if (convertQueueRef.current.length > 0) {
-        setTimeout(() => flush(), 50);
-      }
-    }
-  }, [loading, flush]);
 
   // 加载历史会话记录
   useEffect(() => {
@@ -741,7 +654,6 @@ export function AgentProvider({
             if (data.history && Array.isArray(data.history)) {
             const clearOffset = data.clear_offset ?? 0;
             const filtered = data.history.slice(clearOffset);
-            const downloadedBvids = new Set<string>();
             const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => {
               const metadata =
                 record.metadata && typeof record.metadata === "object"
@@ -750,14 +662,6 @@ export function AgentProvider({
               const cards = Array.isArray(metadata.track_cards)
                 ? (metadata.track_cards as TrackCardData[])
                 : undefined;
-              cards?.forEach((card) => {
-                if (
-                  card.bvid &&
-                  (card.source_type === "local" || card.download_status === "downloaded")
-                ) {
-                  downloadedBvids.add(card.bvid);
-                }
-              });
               return {
                 id: newId(),
                 role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
@@ -767,13 +671,6 @@ export function AgentProvider({
               };
             });
             setMessages(historyMessages);
-            if (downloadedBvids.size) {
-              setConvertedSet((previous) => {
-                const next = new Set(previous);
-                downloadedBvids.forEach((bvid) => next.add(bvid));
-                return next;
-              });
-            }
           }
         }
       } catch {
@@ -861,11 +758,7 @@ export function AgentProvider({
       sessionId,
       sendMessage,
       clearMessages,
-      queueConvert,
       cancel,
-      convertQueue,
-      convertingSet,
-      convertedSet,
       currentScenario,
       setCurrentScenario,
       scenarios,
@@ -877,7 +770,7 @@ export function AgentProvider({
       toggleVoiceOutput,
       stopVoiceOutput,
     }),
-    [messages, loading, sessionId, sendMessage, clearMessages, queueConvert, cancel, convertQueue, convertingSet, convertedSet, currentScenario, scenarios, addScenario, deleteScenario, voiceOutputEnabled, voiceSpeaking, voiceOutputError, toggleVoiceOutput, stopVoiceOutput]
+    [messages, loading, sessionId, sendMessage, clearMessages, cancel, currentScenario, scenarios, addScenario, deleteScenario, voiceOutputEnabled, voiceSpeaking, voiceOutputError, toggleVoiceOutput, stopVoiceOutput]
   );
 
   return (

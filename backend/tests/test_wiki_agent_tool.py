@@ -1,8 +1,6 @@
 import json
 import os
-import subprocess
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -157,27 +155,29 @@ def test_wiki_ingest_rejects_missing_source_identity():
         raise AssertionError("missing source identity should be rejected")
 
 
-def test_convert_video_returns_ingest_ready_metadata_without_writing_wiki(tmp_path, monkeypatch):
-    monkeypatch.setattr(ai_agent.settings, "MUSIC_DIR", str(tmp_path))
-    monkeypatch.setattr(ai_agent.settings, "WIKI_DIR", str(tmp_path / "LLM-Wiki"))
-    monkeypatch.setattr("services.wiki_sync.DEFAULT_DB_PATH", tmp_path / "wiki-sync.db")
-    monkeypatch.setattr(ai_agent.settings, "BILIBILI_COOKIES_FILE", "")
-    monkeypatch.setattr(ai_agent.settings, "BILIBILI_DOWNLOAD_TIMEOUT_SECONDS", 300)
-
+def test_convert_video_queues_background_job_without_writing_wiki(monkeypatch):
     ingest_called = False
 
     def unexpected_ingest(*args, **kwargs):
         nonlocal ingest_called
         ingest_called = True
 
-    def fake_run(command, **kwargs):
-        output_template = Path(command[command.index("--output") + 1])
-        output_path = Path(str(output_template).replace("%(ext)s", "mp3"))
-        output_path.write_bytes(b"test audio")
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+    captured = {}
+
+    def fake_create_download_job(*, user_id, items):
+        captured.update({"user_id": user_id, "items": items})
+        return {
+            "id": "job-1",
+            "user_id": user_id,
+            "status": "queued",
+            "items": items,
+        }
 
     monkeypatch.setattr("services.wiki_ingest.ingest_song", unexpected_ingest)
-    monkeypatch.setattr("services.bili_downloader.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "services.download_job_service.create_download_job",
+        fake_create_download_job,
+    )
 
     result = json.loads(
         {
@@ -206,24 +206,14 @@ def test_convert_video_returns_ingest_ready_metadata_without_writing_wiki(tmp_pa
 
     assert result["success"] is True
     assert ingest_called is False
-    assert result["files"][0] == {
-        "original": "BV123.mp3",
-        "renamed": "测试歌手-测试歌曲-BV123.mp3",
+    assert result["status"] == "queued"
+    assert result["job_id"] == "job-1"
+    assert captured["user_id"] == "local"
+    assert captured["items"] == [{
         "bvid": "BV123",
+        "url": "https://www.bilibili.com/video/BV123",
         "title": "测试歌曲",
         "artist": "测试歌手",
         "uploader": "测试上传者",
         "video_title": "原始视频标题",
-        "url": "https://www.bilibili.com/video/BV123",
-        "local_file_path": str(
-            (
-                next(
-                    path
-                    for path in tmp_path.iterdir()
-                    if path.is_dir() and path.name.isdigit()
-                )
-                / "测试歌手-测试歌曲-BV123.mp3"
-            ).resolve()
-        ),
-        "existing": False,
-    }
+    }]

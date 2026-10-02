@@ -145,6 +145,23 @@ def observed_tool_names(messages: Iterable[BaseMessage]) -> set[str]:
     return names
 
 
+def _latest_tool_payload(
+    messages: Iterable[BaseMessage],
+    tool_name: str,
+) -> dict[str, Any] | None:
+    for message in reversed(list(messages)):
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "name", None) != tool_name:
+            continue
+        try:
+            payload = json.loads(_message_text(message))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def _dispatched_client_actions(messages: Iterable[BaseMessage]) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     for message in messages:
@@ -277,6 +294,19 @@ def validate_final_response(
 
     observed = observed_tool_names(messages)
     action_claims = _action_claims(stripped)
+    download_claimed = any(label in {"下载", "转换"} for label, _ in action_claims)
+    if download_claimed and "convert_video" in observed:
+        download_result = _latest_tool_payload(messages, "convert_video")
+        if download_result and download_result.get("status") == "queued":
+            return ProtocolViolation(
+                "download_still_queued",
+                "下载工具只创建了后台任务，尚未完成下载；请说明任务已进入队列",
+            )
+        if download_result and download_result.get("success") is False:
+            return ProtocolViolation(
+                "download_failed",
+                "下载工具返回失败，不能声称下载或转换已经成功",
+            )
     playback_claimed = any(
         label in {
             "播放",
@@ -368,6 +398,19 @@ def safe_protocol_response(
             error = str(result.get("result", {}).get("error") or "未知错误")
             return f"播放器执行失败：{error}"
         return "播放指令已经发送，但暂未收到浏览器的执行确认。请检查播放器状态。"
+
+    download_result = _latest_tool_payload(message_list, "convert_video")
+    if download_result:
+        if download_result.get("status") == "queued":
+            job_id = str(download_result.get("job_id") or "").strip()
+            suffix = f"（任务 {job_id[:8]}）" if job_id else ""
+            return f"下载任务已进入后台队列{suffix}，可在“下载任务”中查看进度、取消或重试。"
+        if download_result.get("success") is False:
+            errors = download_result.get("errors")
+            if isinstance(errors, list) and errors and isinstance(errors[-1], dict):
+                detail = str(errors[-1].get("message") or "下载任务创建失败")
+                return f"下载任务未能启动：{detail}"
+            return "下载任务未能启动，请查看工具错误后重试。"
 
     for message in reversed(message_list):
         if not isinstance(message, ToolMessage) or getattr(message, "name", "") != "present_tracks":

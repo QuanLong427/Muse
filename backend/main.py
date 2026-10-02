@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import bili, chat, config, dream, history, memory, music_library, playback, playlist, scenario, search, tracks, voice, wiki
+from routers import bili, chat, config, downloads, dream, history, memory, music_library, playback, playlist, scenario, search, tracks, voice, wiki
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,10 @@ async def lifespan(app: FastAPI):
         init_music_library_db()
         from services.player_action_store import init_player_action_db
         init_player_action_db()
+        from services.download_job_service import init_download_job_system
+        init_download_job_system()
     except Exception as e:
-        logger.error(f"[startup] Playback session DB init failed: {e}")
+        logger.error(f"[startup] Runtime store initialization failed: {e}")
 
     # Startup: start dream scheduler
     _dream_task = asyncio.create_task(_dream_scheduler())
@@ -94,6 +96,7 @@ app.add_middleware(
 app.include_router(bili.router)
 app.include_router(chat.router)
 app.include_router(config.router)
+app.include_router(downloads.router)
 app.include_router(dream.router)
 app.include_router(history.router)
 app.include_router(memory.router)

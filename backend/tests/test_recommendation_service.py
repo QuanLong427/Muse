@@ -152,6 +152,31 @@ def test_radio_ranks_recently_preferred_artist_first(monkeypatch):
     )
 
 
+def test_radio_scopes_recent_preferences_to_current_scenario(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(service, "scan_tracks", lambda: [_track("fresh")])
+    monkeypatch.setattr(service, "list_recent_tracks", lambda **kwargs: [])
+    monkeypatch.setattr(service, "list_feedback_excluded_track_ids", lambda user_id: set())
+    monkeypatch.setattr(
+        service,
+        "build_recent_preference_profile",
+        lambda user_id, **kwargs: captured.update(kwargs) or _empty_profile(),
+    )
+    monkeypatch.setattr(
+        service,
+        "record_recommendation_batch",
+        lambda **kwargs: {"id": "batch-scenario"},
+    )
+
+    service.recommend_local_radio_tracks(
+        user_id="local",
+        scenario="夜跑",
+        limit=1,
+    )
+
+    assert captured["scenario"] == "夜跑"
+
+
 def test_conversation_recommendation_balances_local_and_cloud(monkeypatch):
     tracks = [_track(f"local-{index}") for index in range(4)]
     recorded = _prepare_conversation_dependencies(monkeypatch, tracks)

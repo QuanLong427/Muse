@@ -201,6 +201,23 @@ def test_still_rejects_actual_download_success_claim_without_tool():
     assert violation.code == "unobserved_action_claim"
 
 
+def test_rejects_download_success_claim_when_job_is_only_queued():
+    messages = [
+        HumanMessage(content="下载七里香"),
+        ToolMessage(
+            name="convert_video",
+            tool_call_id="download-1",
+            content='{"success":true,"status":"queued","job_id":"job-123"}',
+        ),
+    ]
+
+    violation = validate_final_response("《七里香》已经下载完成。", messages, TOOLS)
+
+    assert violation is not None
+    assert violation.code == "download_still_queued"
+    assert "后台队列" in safe_protocol_response(violation, messages)
+
+
 def test_still_rejects_actual_conversion_success_claim_without_tool():
     violation = validate_final_response("《七里香》转换已完成。", [], TOOLS)
 

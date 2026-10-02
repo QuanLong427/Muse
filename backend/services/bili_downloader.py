@@ -11,15 +11,26 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from queue import Empty, Queue
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 
 _BVID_PATTERN = re.compile(r"/video/(BV[0-9A-Za-z]{3,20})(?:[/?.]|$)")
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _BILIBILI_ORIGIN = "https://www.bilibili.com"
+_PROGRESS_PATTERN = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+CancelCheck = Callable[[], bool]
+
+
+class DownloadCancelled(RuntimeError):
+    """Raised internally after terminating an active yt-dlp process."""
 
 
 def extract_bvid(url: str) -> str:
@@ -72,7 +83,6 @@ def _download_command(
         "yt_dlp",
         "--ignore-config",
         "--no-playlist",
-        "--no-progress",
         "--newline",
         "--extract-audio",
         "--audio-format",
@@ -104,6 +114,95 @@ def _download_command(
         command.extend(["--cookies", str(cookie_file)])
     command.append(url)
     return command
+
+
+def _run_download_command(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    bvid: str,
+    progress_callback: ProgressCallback | None,
+    cancel_requested: CancelCheck | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run yt-dlp synchronously or with observable progress and cancellation."""
+    bounded_timeout = max(60, min(int(timeout_seconds), 900))
+    if progress_callback is None and cancel_requested is None:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=bounded_timeout,
+            check=False,
+        )
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    output_queue: Queue[str | None] = Queue()
+    captured: list[str] = []
+
+    def _read_output() -> None:
+        assert process.stdout is not None
+        try:
+            for line in process.stdout:
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    threading.Thread(target=_read_output, daemon=True).start()
+    deadline = time.monotonic() + bounded_timeout
+    stream_closed = False
+    try:
+        while not stream_closed or process.poll() is None:
+            if cancel_requested and cancel_requested():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                raise DownloadCancelled("download cancelled")
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.wait(timeout=5)
+                raise subprocess.TimeoutExpired(command, bounded_timeout)
+            try:
+                line = output_queue.get(timeout=0.25)
+            except Empty:
+                continue
+            if line is None:
+                stream_closed = True
+                continue
+            captured.append(line)
+            if len(captured) > 400:
+                del captured[:200]
+            match = _PROGRESS_PATTERN.search(line)
+            if match and progress_callback:
+                progress_callback(
+                    {
+                        "bvid": bvid,
+                        "status": "downloading",
+                        "progress": max(0.0, min(float(match.group(1)), 100.0)),
+                    }
+                )
+        return subprocess.CompletedProcess(
+            command,
+            int(process.returncode or 0),
+            stdout="".join(captured),
+            stderr="",
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def _download_error(stderr: str, *, cookies_configured: bool) -> dict[str, Any]:
@@ -143,6 +242,8 @@ def download_bilibili_audio(
     music_dir: str,
     cookie_file: str = "",
     timeout_seconds: int = 300,
+    progress_callback: ProgressCallback | None = None,
+    cancel_requested: CancelCheck | None = None,
 ) -> dict[str, Any]:
     """Download Bilibili URLs sequentially and return stable local metadata."""
     root = Path(music_dir)
@@ -184,6 +285,15 @@ def download_bilibili_audio(
     errors: list[dict[str, Any]] = []
 
     for url in urls:
+        if cancel_requested and cancel_requested():
+            errors.append(
+                {
+                    "code": "download_cancelled",
+                    "message": "下载任务已取消。",
+                    "retryable": True,
+                }
+            )
+            break
         try:
             bvid = extract_bvid(url)
         except ValueError as exc:
@@ -218,30 +328,45 @@ def download_bilibili_audio(
                     existing=True,
                 )
             )
+            if progress_callback:
+                progress_callback(
+                    {"bvid": bvid, "status": "downloaded", "progress": 100.0}
+                )
             continue
 
         try:
+            if progress_callback:
+                progress_callback(
+                    {"bvid": bvid, "status": "downloading", "progress": 0.0}
+                )
             with tempfile.TemporaryDirectory(prefix=".musicer-download-", dir=target_dir) as raw_work_dir:
                 work_dir = Path(raw_work_dir)
-                result = subprocess.run(
+                result = _run_download_command(
                     _download_command(
                         url=url,
                         bvid=bvid,
                         work_dir=work_dir,
                         cookie_file=cookies,
                     ),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=max(60, min(int(timeout_seconds), 900)),
-                    check=False,
+                    timeout_seconds=timeout_seconds,
+                    bvid=bvid,
+                    progress_callback=progress_callback,
+                    cancel_requested=cancel_requested,
                 )
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or "yt-dlp exited with an error").strip()
                     error = _download_error(detail, cookies_configured=bool(cookies))
                     error.update({"bvid": bvid, "url": url, "detail": detail[-2000:]})
                     errors.append(error)
+                    if progress_callback:
+                        progress_callback(
+                            {
+                                "bvid": bvid,
+                                "status": "failed",
+                                "progress": 0.0,
+                                "error": error,
+                            }
+                        )
                     continue
 
                 candidates = sorted(work_dir.glob("*.mp3"))
@@ -255,6 +380,15 @@ def download_bilibili_audio(
                             "retryable": True,
                         }
                     )
+                    if progress_callback:
+                        progress_callback(
+                            {
+                                "bvid": bvid,
+                                "status": "failed",
+                                "progress": 0.0,
+                                "error": errors[-1],
+                            }
+                        )
                     continue
                 downloaded = candidates[0]
                 already_created = final_path.exists()
@@ -273,6 +407,29 @@ def download_bilibili_audio(
                         existing=already_created,
                     )
                 )
+                if progress_callback:
+                    progress_callback(
+                        {"bvid": bvid, "status": "downloaded", "progress": 100.0}
+                    )
+        except DownloadCancelled:
+            error = {
+                "code": "download_cancelled",
+                "message": "下载任务已取消。",
+                "bvid": bvid,
+                "url": url,
+                "retryable": True,
+            }
+            errors.append(error)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "bvid": bvid,
+                        "status": "cancelled",
+                        "progress": 0.0,
+                        "error": error,
+                    }
+                )
+            break
         except subprocess.TimeoutExpired:
             errors.append(
                 {
@@ -283,6 +440,15 @@ def download_bilibili_audio(
                     "retryable": True,
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "bvid": bvid,
+                        "status": "failed",
+                        "progress": 0.0,
+                        "error": errors[-1],
+                    }
+                )
         except OSError as exc:
             errors.append(
                 {
@@ -293,10 +459,28 @@ def download_bilibili_audio(
                     "retryable": False,
                 }
             )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "bvid": bvid,
+                        "status": "failed",
+                        "progress": 0.0,
+                        "error": errors[-1],
+                    }
+                )
 
+    cancelled = any(error.get("code") == "download_cancelled" for error in errors)
     return {
         "success": not errors and bool(files),
-        "status": "success" if not errors and files else "partial" if files else "failed",
+        "status": (
+            "success"
+            if not errors and files
+            else "partial"
+            if files
+            else "cancelled"
+            if cancelled
+            else "failed"
+        ),
         "files": files,
         "errors": errors,
         "cookies_configured": bool(cookies),

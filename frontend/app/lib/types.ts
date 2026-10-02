@@ -13,6 +13,65 @@ export interface Track {
 export type TrackAction = "play" | "download" | "add_to_session" | "add_to_playlist";
 export type DownloadStatus = "idle" | "queued" | "downloading" | "downloaded" | "failed";
 
+export type DownloadJobStatus =
+  | "queued"
+  | "running"
+  | "cancel_requested"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "cancelled";
+
+export type DownloadJobItemStatus =
+  | "queued"
+  | "downloading"
+  | "downloaded"
+  | "failed"
+  | "cancelled";
+
+export interface DownloadRequestTrack {
+  bvid: string;
+  title?: string;
+  author?: string;
+  uploader?: string;
+  videoTitle?: string;
+}
+
+export interface DownloadJobItem {
+  id: string;
+  position: number;
+  bvid: string;
+  url: string;
+  title: string;
+  artist: string;
+  uploader: string;
+  video_title: string;
+  status: DownloadJobItemStatus;
+  progress: number;
+  result: Record<string, unknown>;
+  error: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DownloadJob {
+  id: string;
+  user_id: string;
+  status: DownloadJobStatus;
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  progress: number;
+  cancel_requested: boolean;
+  result: Record<string, unknown>;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  items: DownloadJobItem[];
+}
+
 export interface TrackCardData {
   track_id: string;
   source_type: "local" | "bilibili";

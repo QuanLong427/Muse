@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from services.scenario_manager import add_scenario, read_scenarios, remove_scenario
 from services.memory_manager import remove_profile_scenario
+from services.memory_store import DEFAULT_USER_ID, forget_memory_scenario
 
 router = APIRouter(tags=["scenario"])
 
@@ -30,5 +31,6 @@ async def create_scenario(req: AddScenarioRequest):
 async def delete_scenario(name: str):
     """删除场景"""
     scenarios = remove_scenario(name)
-    remove_profile_scenario(name)
+    forget_memory_scenario(user_id=DEFAULT_USER_ID, scenario=name)
+    remove_profile_scenario(name, DEFAULT_USER_ID)
     return {"scenarios": scenarios}

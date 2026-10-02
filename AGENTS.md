@@ -38,7 +38,7 @@ Musicer 是一个面向个人曲库的智能音乐播放器。Next.js 前端负�
 - [install.md](install.md)：唯一正式安装路径，使用 Docker Compose。
 - [docs/项目架构说明.md](docs/项目架构说明.md)：当前运行架构、模块职责、数据流、已知缺口和目标演进。
 - [docs/需求文档.md](docs/需求文档.md)：产品目标、功能需求、优先级和验收标准。
-- [docs/记忆系统说明.md](docs/记忆系统说明.md)：当前记忆 v2.1 的数据层、episode 召回、触发策略和边界。
+- [docs/记忆系统说明.md](docs/记忆系统说明.md)：当前记忆 v2.2 的数据层、长期记忆/episode 召回、场景投影、触发策略和边界。
 - [docs/references/README.md](docs/references/README.md)：外部 API 参考资料索引，只作为实现依据，不作为项目现状说明。
 - `skills/*/SKILL.md`：运行时 Agent Skill 的真实说明；修改 Skill 行为时以这些文件为入口。
 

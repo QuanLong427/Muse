@@ -694,7 +694,11 @@ def recommend_local_radio_tracks(
         )
     ]
 
-    profile = build_recent_preference_profile(user_id, catalog_tracks=catalog)
+    profile = build_recent_preference_profile(
+        user_id,
+        catalog_tracks=catalog,
+        scenario=scenario,
+    )
     recent_profile = get_preference_window(profile, 7)
     track_scores, max_track_score = _positive_score_map(
         recent_profile.get("tracks"), "track_id"

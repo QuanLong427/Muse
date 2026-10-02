@@ -43,8 +43,15 @@ def test_system_prompt_includes_global_and_current_scenario_profile(monkeypatch)
     monkeypatch.setattr(ai_agent, "read_profile", lambda user_id="local": profile)
     monkeypatch.setattr(
         ai_agent,
+        "read_scenario_profile",
+        lambda scenario="默认", user_id="local": (
+            "# 场景偏好：跑步\n- 优先高节奏音乐" if scenario == "跑步" else ""
+        ),
+    )
+    monkeypatch.setattr(
+        ai_agent,
         "get_structured_memory_context",
-        lambda user_id, scenario: "- [跑步] 不要推荐慢歌",
+        lambda user_id, scenario, query="": "- [跑步] 不要推荐慢歌",
     )
 
     prompt = _build_system_prompt("跑步", "user-a")

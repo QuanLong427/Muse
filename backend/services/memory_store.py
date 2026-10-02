@@ -898,6 +898,31 @@ def forget_memory_item(
         conn.close()
 
 
+def forget_memory_scenario(
+    *,
+    user_id: str,
+    scenario: str,
+) -> int:
+    """Soft-delete active durable memories when a user removes a scene."""
+    init_memory_db()
+    normalized = (scenario or "").strip()[:80]
+    if not normalized or normalized == "全局":
+        return 0
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE memory_items SET status = 'forgotten', updated_at = ?
+            WHERE user_id = ? AND scenario = ? AND status = 'active'
+            """,
+            (_now(), user_id, normalized),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
 def stage_candidate(
     *,
     user_id: str,

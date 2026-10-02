@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { Track, TrackCardData } from "@/app/lib/types";
 import type { ChatMessage as ChatMessageModel } from "@/app/lib/types";
 import { usePlayer } from "@/app/context/PlayerContext";
-import { useAgent } from "@/app/context/AgentContext";
+import { useDownloads } from "@/app/context/DownloadContext";
 import { useDanmaku } from "@/app/context/DanmakuContext";
 import { usePlaylists } from "@/app/context/PlaylistContext";
 import { MarkdownContent } from "@/app/components/molecules/MarkdownContent";
@@ -135,7 +135,7 @@ function legacyTrackCard(track: TrackExt): TrackCardData {
 
 function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardData[] }) {
   const { state, addTracks, playTrack, play } = usePlayer();
-  const { queueConvert, convertingSet, convertedSet } = useAgent();
+  const { queueDownload, cancelJob, retryJob, itemByBvid } = useDownloads();
   const { fetchDanmaku } = useDanmaku();
   const { playlists, addTrack: addTrackToPlaylist } = usePlaylists();
   const inSession = new Set([
@@ -161,7 +161,8 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
         (card.source_type === "local" ||
           Boolean(
             card.bvid &&
-              (convertedSet.has(card.bvid) || card.download_status === "downloaded")
+              (itemByBvid.get(card.bvid)?.status === "downloaded" ||
+                card.download_status === "downloaded")
           ))
     );
     for (const card of unresolved) {
@@ -196,7 +197,7 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
     return () => {
       cancelled = true;
     };
-  }, [convertedSet, normalizedCards, resolutionComplete, resolvedLocal]);
+  }, [itemByBvid, normalizedCards, resolutionComplete, resolvedLocal]);
 
   const effectiveCards = useMemo(
     () =>
@@ -228,9 +229,18 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
     });
   }, [effectiveCards]);
 
-  const handleDownload = (track: TrackCardData) => {
+  const handleDownload = async (track: TrackCardData) => {
     if (!track.bvid) return;
-    queueConvert([{ bvid: track.bvid, title: track.title, author: track.author }]);
+    const current = itemByBvid.get(track.bvid);
+    if (current?.status === "queued" || current?.status === "downloading") {
+      await cancelJob(current.job_id);
+    } else if (current?.status === "failed" || current?.status === "cancelled") {
+      await retryJob(current.job_id);
+    } else {
+      await queueDownload([
+        { bvid: track.bvid, title: track.title, author: track.author },
+      ]);
+    }
     fetchDanmaku(track.bvid);
   };
 
@@ -271,11 +281,15 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
               (state.current?.id === localTrack.id ||
                 Boolean(t.bvid && state.current?.bvid === t.bvid))
           );
-          const isDownloading = Boolean(t.bvid && convertingSet.has(t.bvid));
+          const downloadItem = t.bvid ? itemByBvid.get(t.bvid) : undefined;
+          const isDownloading =
+            downloadItem?.status === "queued" || downloadItem?.status === "downloading";
           const wasDownloaded = Boolean(
             t.download_status === "downloaded" ||
-              (t.bvid && convertedSet.has(t.bvid))
+              downloadItem?.status === "downloaded"
           );
+          const downloadFailed =
+            downloadItem?.status === "failed" || downloadItem?.status === "cancelled";
           const isLocal = t.availability === "local" && Boolean(localTrack);
           const isResolving =
             t.source_type === "local" &&
@@ -338,8 +352,26 @@ function TrackCards({ tracks, cards }: { tracks?: TrackExt[]; cards?: TrackCardD
                   </select>
                 )}
                 {!isLocal && t.source_type === "bilibili" && t.bvid && (
-                  <button onClick={() => handleDownload(t)} disabled={isDownloading || wasDownloaded} className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40" style={{ color: "var(--color-primary)" }}>
-                    {isDownloading ? "DOWNLOADING..." : wasDownloaded ? "DOWNLOADED" : "⇩ DOWNLOAD"}
+                  <button
+                    onClick={() => void handleDownload(t)}
+                    disabled={wasDownloaded}
+                    title={
+                      typeof downloadItem?.error?.message === "string"
+                        ? downloadItem.error.message
+                        : isDownloading
+                          ? "点击取消下载"
+                          : undefined
+                    }
+                    className="rounded-full border border-[rgba(129,140,248,0.3)] px-2.5 py-0.5 text-[10px] font-medium uppercase disabled:opacity-40"
+                    style={{ color: "var(--color-primary)" }}
+                  >
+                    {isDownloading
+                      ? `CANCEL ${Math.round(downloadItem?.progress ?? 0)}%`
+                      : wasDownloaded
+                        ? "DOWNLOADED"
+                        : downloadFailed
+                          ? "↻ RETRY"
+                          : "⇩ DOWNLOAD"}
                   </button>
                 )}
                 {!isLocal && t.source_type === "local" && (

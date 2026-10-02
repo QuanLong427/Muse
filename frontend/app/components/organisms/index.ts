@@ -1,5 +1,6 @@
 export { AgentChat } from "./AgentChat";
 export { ClockPanel } from "./ClockPanel";
+export { DownloadsPanel } from "./DownloadsPanel";
 export { MusicVisualizer } from "./MusicVisualizer";
 export { MusicWorkspace } from "./MusicWorkspace";
 export { LocalLibrary } from "./LocalLibrary";
