@@ -16,6 +16,7 @@ def test_discover_skills():
     assert "cloud-search" in names
     assert "convert" in names
     assert "llm-wiki" in names
+    assert "smart-playlist" in names
 
 
 def test_discover_skills_metadata():
@@ -57,6 +58,13 @@ def test_load_llm_wiki_skill():
     full, body = load_skill("llm-wiki")
     assert "name: llm-wiki" in full
     assert "backend/services/wiki_ingest.py" in body
+
+
+def test_load_smart_playlist_skill():
+    full, body = load_skill("smart-playlist")
+    assert "name: smart-playlist" in full
+    assert "create_smart_playlist" in body
+    assert "needs_confirmation" in body
 
 
 def test_load_skill_resource_is_confined_to_references():

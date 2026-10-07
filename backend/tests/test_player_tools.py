@@ -50,6 +50,7 @@ def test_player_tools_are_available_and_return_snapshot():
     assert "get_recent_music_preferences" in tools
     assert "recommend_next" in tools
     assert "recommend_music" in tools
+    assert "create_smart_playlist" in tools
     assert "explain_recommendation" in tools
     assert "search_memory" in tools
     assert "remember_preference" in tools
@@ -259,6 +260,134 @@ def test_recommend_next_dispatches_audited_batch(monkeypatch):
         "origin_type": "radio",
         "origin_id": "batch-1",
     }
+
+
+def test_create_smart_playlist_can_preview_and_play_with_exact_tracks(monkeypatch):
+    monkeypatch.setattr("services.playlist_draft_service.create_draft", lambda preview, **kwargs: {"id": "draft", "items": preview["tracks"]})
+    track = {
+        "id": "library/smart.mp3",
+        "title": "Smart Song",
+        "author": "Artist",
+        "date": "",
+        "filename": "smart.mp3",
+        "subDir": "library",
+        "size": 1,
+        "url": "/api/tracks/library/smart.mp3",
+        "bvid": None,
+    }
+    captured = {}
+    monkeypatch.setattr(
+        "services.smart_playlist_service.generate_smart_playlist",
+        lambda **kwargs: captured.update(kwargs)
+        or {
+            "status": "ok",
+            "batch_id": "smart-batch",
+            "suggested_name": "夜跑智能歌单",
+            "tracks": [track],
+            "recommendations": [],
+            "warnings": [],
+        },
+    )
+    tools = _tools_by_name({"available": True})
+    activated = tools["activate_skill"].invoke({"name": "smart-playlist"})
+    assert "智能歌单" in activated
+    tool = tools["create_smart_playlist"]
+
+    preview = json.loads(
+        tool.invoke(
+            {
+                "action": "preview",
+                "count": 8,
+                "include_artists": "周杰伦,Coldplay",
+                "exclude_versions": '["live", "cover"]',
+            }
+        )
+    )
+    assert preview["status"] == "draft"
+    assert preview["draft"]["id"] == "draft"
+    assert captured["count"] == 8
+    assert captured["include_artists"] == ["周杰伦", "Coldplay"]
+    assert captured["exclude_versions"] == ["live", "cover"]
+
+    played = json.loads(tool.invoke({"action": "play", "count": 8}))
+    assert played["status"] == "dispatched"
+    assert played["client_action"] | {"action_id": None} == {
+        "target": "player",
+        "action": "play_collection",
+        "tracks": [track],
+        "origin_type": "smart_playlist",
+        "origin_id": "smart-batch",
+        "action_id": None,
+    }
+
+
+def test_create_smart_playlist_does_not_apply_unverified_constraints(monkeypatch):
+    monkeypatch.setattr(
+        "services.smart_playlist_service.generate_smart_playlist",
+        lambda **kwargs: {
+            "status": "partial",
+            "batch_id": "smart-batch",
+            "tracks": [
+                {
+                    "id": "library/smart.mp3",
+                    "title": "Smart Song",
+                    "author": "Artist",
+                    "date": "",
+                    "filename": "smart.mp3",
+                    "subDir": "library",
+                    "size": 1,
+                    "url": "/api/tracks/library/smart.mp3",
+                    "bvid": None,
+                }
+            ],
+            "recommendations": [],
+            "warnings": [{"code": "energy_curve_metadata_unavailable"}],
+        },
+    )
+    tools = _tools_by_name({"available": True})
+    tools["activate_skill"].invoke({"name": "smart-playlist"})
+    tool = tools["create_smart_playlist"]
+
+    result = json.loads(tool.invoke({"action": "play", "energy_curve": "rising"}))
+
+    assert result["status"] == "needs_confirmation"
+    assert "client_action" not in result
+
+
+def test_create_smart_playlist_requires_progressive_skill_activation():
+    result = json.loads(
+        _tools_by_name({"available": True})["create_smart_playlist"].invoke({})
+    )
+
+    assert result["status"] == "error"
+    assert result["required_skill"] == "smart-playlist"
+
+
+def test_saving_existing_smart_preview_does_not_regenerate(monkeypatch):
+    monkeypatch.setattr("services.smart_playlist_service.generate_smart_playlist", lambda **kwargs: (_ for _ in ()).throw(AssertionError("must save exact preview")))
+    monkeypatch.setattr("services.playlist_draft_service.create_draft", lambda preview, **kwargs: {"id": "draft", "batch_id": preview["batch_id"]})
+    tools = _tools_by_name()
+    tools["activate_skill"].invoke({"name": "smart-playlist"})
+    result = json.loads(tools["create_smart_playlist"].invoke({"action": "save", "preview_batch_id": "batch", "name": "测试"}))
+    assert result["status"] == "draft"
+    assert result["draft"]["batch_id"] == "batch"
+    assert "job" not in result
+
+
+def test_smart_playlist_append_propagates_exact_target_without_playing(monkeypatch):
+    captured = {}
+    monkeypatch.setattr("services.smart_playlist_service.generate_smart_playlist", lambda **kwargs: captured.update(kwargs) or {
+        "batch_id": "batch", "tracks": [], "remote_candidates": [{"bvid": "BV123", "title": "Song"}],
+        "result_count": 1, "warnings": []})
+    monkeypatch.setattr("services.playlist_draft_service.create_draft", lambda preview, **kwargs: {"id": "draft"})
+    tools = _tools_by_name()
+    tools["activate_skill"].invoke({"name": "smart-playlist"})
+    result = json.loads(tools["create_smart_playlist"].invoke({"action": "save", "count": 10, "target_playlist_id": "original"}))
+    assert captured["target_playlist_id"] == "original"
+    assert result["status"] == "draft"
+    assert "client_action" not in result
+    rejected = json.loads(tools["create_smart_playlist"].invoke({"action": "play", "target_playlist_id": "original"}))
+    assert rejected["status"] == "invalid"
 
 
 def test_recommend_music_registers_local_and_cloud_cards(monkeypatch):

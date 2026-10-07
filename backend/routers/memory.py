@@ -1,5 +1,6 @@
 """Inspectable management API for the Musicer memory system."""
 
+import asyncio
 from fastapi import APIRouter, Query
 
 from services.memory_manager import pending_history_count, sync_profile_projection
@@ -14,6 +15,20 @@ from services.memory_store import (
 
 
 router = APIRouter(tags=["memory"])
+
+
+@router.get("/api/memory/tasks")
+async def get_tasks(user_id: str = Query(DEFAULT_USER_ID, min_length=1, max_length=128),
+                    session_id: str = Query("default", min_length=1, max_length=256)):
+    from services.agent_context import live_task_context
+    return await asyncio.to_thread(live_task_context, user_id, session_id)
+
+
+@router.get("/api/memory/profile")
+async def get_profile(user_id: str = Query(DEFAULT_USER_ID, min_length=1, max_length=128),
+                      scenario: str = Query("默认", min_length=1, max_length=80)):
+    from services.memory_profile_service import get_scene_profile
+    return await asyncio.to_thread(get_scene_profile, user_id, scenario)
 
 
 @router.get("/api/memory")

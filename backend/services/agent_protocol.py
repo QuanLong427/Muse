@@ -33,19 +33,19 @@ _DEFERRED_ENDINGS = (
 _ACTION_CLAIM_PATTERNS = (
     (
         "播放",
-        {"control_player", "play_track", "play_music_playlist"},
+        {"control_player", "play_track", "play_music_playlist", "create_smart_playlist"},
         re.compile(
             r"(?:已经|已)(?:成功)?(?:为(?:您|你))?(?:成功)?(?:开始)?播放|播放成功"
         ),
     ),
     (
         "创建歌单",
-        {"create_music_playlist", "manage_music_playlist"},
+        {"create_music_playlist", "manage_music_playlist", "create_smart_playlist", "manage_playlist_draft"},
         re.compile(r"(?:已经|已)(?:成功)?创建(?:了)?歌单|歌单创建成功"),
     ),
     (
         "加入歌单",
-        {"add_track_to_music_playlist", "manage_music_playlist"},
+        {"add_track_to_music_playlist", "manage_music_playlist", "create_smart_playlist", "manage_playlist_draft"},
         re.compile(r"(?:已经|已)(?:成功)?(?:将[^。！？；;\n]{0,40})?加入(?:了)?歌单"),
     ),
     (
@@ -96,7 +96,7 @@ _ACTION_CLAIM_PATTERNS = (
     ),
     (
         "下载",
-        {"convert_video"},
+        {"convert_video", "create_smart_playlist", "manage_playlist_draft"},
         re.compile(
             r"(?:已经|已)(?:成功)?(?:将[^。！？；;\n]{0,40})?下载"
             r"(?!的|歌曲|音乐|内容|文件|音频|曲目|资源)|下载成功"
@@ -104,7 +104,7 @@ _ACTION_CLAIM_PATTERNS = (
     ),
     (
         "转换",
-        {"convert_video"},
+        {"convert_video", "create_smart_playlist", "manage_playlist_draft"},
         re.compile(r"(?:已经|已)(?:成功)?转换|转换(?:已|已经)?(?:完成|成功)"),
     ),
 )
@@ -159,6 +159,16 @@ def _latest_tool_payload(
         except json.JSONDecodeError:
             return None
         return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _latest_smart_result(messages):
+    for message in reversed(list(messages)):
+        if isinstance(message, ToolMessage) and message.name in {"create_smart_playlist", "manage_playlist_draft"}:
+            payload = _latest_tool_payload([message], message.name)
+            if message.name == "manage_playlist_draft" and payload and payload.get("action") in {"read", "list"}:
+                continue
+            return payload
     return None
 
 
@@ -293,8 +303,51 @@ def validate_final_response(
         )
 
     observed = observed_tool_names(messages)
+    draft_mutation_claim = bool(re.search(
+        r"(?:已经|已)(?:成功)?(?:(?:将|把|从)[^。！？；;\n]{0,80})?(?:移除|删除|替换|换掉|改名|重排|更新|调整)|草稿(?:已经|已)(?:成功)?(?:更新|修改|调整)", stripped))
+    if draft_mutation_claim and re.search(r"草稿|第[一二三四五六七八九十\d]+首", stripped):
+        mutation = _latest_smart_result(messages)
+        draft = mutation.get("draft") if mutation else None
+        saved = isinstance(draft, dict) and draft.get("status") == "saved" and mutation.get("action") == "confirm" and isinstance(mutation.get("playlist"), dict)
+        if not saved and (not isinstance(draft, dict) or mutation.get("action") not in {"remove", "replace", "rename", "reorder", "filter_versions", "add", "cancel"} or draft.get("revision", -1) <= mutation.get("previous_revision", -1)):
+            return ProtocolViolation("draft_edit_unconfirmed", "没有成功修改草稿的版本回执，不能声称已完成删歌、换歌或调整")
     action_claims = _action_claims(stripped)
+    named_playlist_claimed = any(label == "创建歌单" for label, _ in action_claims)
+    if (
+        named_playlist_claimed
+        and observed.intersection({"create_smart_playlist", "manage_playlist_draft"})
+        and not observed.intersection({"create_music_playlist", "manage_music_playlist"})
+    ):
+        smart_result = _latest_smart_result(messages)
+        if not smart_result or not isinstance(smart_result.get("playlist"), dict):
+            return ProtocolViolation(
+                "smart_playlist_not_saved",
+                "智能歌单工具只生成了预览或播放会话，没有创建命名歌单",
+            )
     download_claimed = any(label in {"下载", "转换"} for label, _ in action_claims)
+    smart_result = _latest_smart_result(messages)
+    if smart_result:
+        draft = smart_result.get("draft")
+        if isinstance(draft, dict) and draft.get("status") != "saved" and (
+            named_playlist_claimed or any(label == "加入歌单" for label, _ in action_claims)
+            or re.search(r"歌单(?:已经|已)(?:成功)?保存|(?:已经|已)(?:成功)?保存(?:了)?(?:智能)?歌单", stripped)
+        ):
+            return ProtocolViolation("smart_playlist_not_saved", "只生成或修改了歌单草稿，尚未保存或加入命名歌单")
+        if named_playlist_claimed and smart_result.get("target_playlist_id"):
+            return ProtocolViolation("smart_playlist_append_not_create", "本次操作向已有歌单追加歌曲，并未新建歌单")
+        smart_job = smart_result.get("job")
+        playlist = smart_result.get("playlist")
+        if isinstance(smart_job, dict) and smart_job.get("status") != "completed" and isinstance(playlist, dict):
+            confirmed_count = int(playlist.get("added_count") or 0)
+            claimed_counts = re.findall(
+                r"(?:已经|已)(?:成功)?(?:为[^。！？；;\n]{0,60}?)?(?:添加|加入)(?:了)?\s*(\d+)\s*首", stripped
+            )
+            if any(int(count) > confirmed_count for count in claimed_counts):
+                return ProtocolViolation("playlist_addition_pending", "联网歌曲尚未加入歌单；请分别报告已加入的本地数量与待下载数量，不得声称所有请求歌曲已添加")
+        if download_claimed and isinstance(smart_job, dict) and smart_job.get("status") != "completed":
+            return ProtocolViolation("download_still_queued", "歌单中的联网歌曲尚未全部下载成功，请报告后台任务的真实状态")
+        if any(label == "播放" for label, _ in action_claims) and smart_result.get("status") == "needs_download":
+            return ProtocolViolation("smart_playlist_needs_download", "联网歌单仍需下载，未下发完整播放指令")
     if download_claimed and "convert_video" in observed:
         download_result = _latest_tool_payload(messages, "convert_video")
         if download_result and download_result.get("status") == "queued":
@@ -371,6 +424,10 @@ def safe_protocol_response(
 ) -> str:
     """Build an evidence-backed terminal response when model repair still fails."""
     message_list = list(messages)
+    if violation.code == "draft_edit_unconfirmed":
+        payload = _latest_tool_payload(message_list, "manage_playlist_draft") or {}
+        error = str(payload.get("error") or "工具参数或执行结果未通过校验")
+        return f"本次草稿修改未得到成功回执：{error}。请以卡片中的当前草稿状态为准，检查后再重试。"
     recommendation_fallback = _latest_recommendation_fallback(message_list)
     recommendation_notice = (
         str(recommendation_fallback.get("user_notice") or "").strip()
@@ -391,7 +448,11 @@ def safe_protocol_response(
         )
         subject = f"《{track_title.strip('《》')}》" if track_title else "该播放器操作"
         if status == "succeeded":
-            if action_name in {"play", "play_track", "play_collection", "next", "previous"}:
+            if action_name == "play_collection":
+                tracks = action.get("tracks")
+                count = len(tracks) if isinstance(tracks, list) else 0
+                return f"播放器已确认执行成功：已加载并开始播放 {count} 首歌曲。"
+            if action_name in {"play", "play_track", "next", "previous"}:
                 return f"播放器已确认执行成功：正在播放{subject}。"
             return "播放器已确认执行成功。"
         if status == "failed":
@@ -411,6 +472,30 @@ def safe_protocol_response(
                 detail = str(errors[-1].get("message") or "下载任务创建失败")
                 return f"下载任务未能启动：{detail}"
             return "下载任务未能启动，请查看工具错误后重试。"
+
+    smart_result = _latest_smart_result(message_list)
+    if smart_result:
+        draft = smart_result.get("draft")
+        if isinstance(draft, dict) and draft.get("status") == "draft":
+            return f"已更新歌单草稿《{draft.get('name') or '智能歌单'}》，共 {len(draft.get('items') or [])} 首。尚未保存或下载；请在卡片中调整后确认添加。"
+        playlist = smart_result.get("playlist")
+        if isinstance(playlist, dict):
+            if smart_result.get("target_playlist_id"):
+                count = int(playlist.get("added_count") or 0)
+                suffix = "联网歌曲已进入后台下载任务，成功后加入同一歌单。" if smart_result.get("job") else "没有待下载歌曲。"
+                return f"歌单“{str(playlist.get('name') or '未命名')}”已更新，本批已加入 {count} 首本地歌曲。{suffix}"
+            if smart_result.get("job"):
+                return f"已创建智能歌单“{str(playlist.get('name') or '未命名歌单')}”，本地歌曲已加入，联网歌曲正在后台下载，成功后自动加入；可在下载任务中查看结果或重试。"
+            return f"智能歌单已保存为“{str(playlist.get('name') or '未命名歌单')}”。"
+        count = int(smart_result.get("result_count") or len(smart_result.get("tracks") or []))
+        if smart_result.get("status") == "needs_confirmation":
+            return (
+                f"已生成包含 {count} 首歌曲的智能歌单预览。"
+                "由于存在未满足或无法核验的约束，本次没有修改播放内容或命名歌单。"
+            )
+        if count:
+            remote_count = len(smart_result.get("remote_candidates") or [])
+            return f"已生成包含 {count} 首歌曲的智能歌单预览，其中 {remote_count} 首需要下载；添加为歌单时会下载联网歌曲。"
 
     for message in reversed(message_list):
         if not isinstance(message, ToolMessage) or getattr(message, "name", "") != "present_tracks":

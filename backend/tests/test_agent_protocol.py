@@ -14,6 +14,7 @@ from services.agent_protocol import (
 
 
 TOOLS = {
+    "manage_playlist_draft",
     "local_search",
     "bili_search",
     "convert_video",
@@ -22,6 +23,7 @@ TOOLS = {
     "set_playback_mode",
     "record_track_feedback",
     "recommend_next",
+    "create_smart_playlist",
 }
 
 
@@ -356,3 +358,108 @@ def test_safe_recovery_includes_recommendation_fallback_notice():
 
     assert "B站搜索暂时不可用" in response
     assert "1 个可验证的歌曲结果" in response
+
+
+def test_smart_playlist_preview_cannot_be_claimed_as_saved_playlist():
+    preview = ToolMessage(
+        content=json.dumps(
+            {"status": "ok", "batch_id": "smart-1", "tracks": [{"id": "one"}]},
+            ensure_ascii=False,
+        ),
+        tool_call_id="call-smart",
+        name="create_smart_playlist",
+    )
+
+    violation = validate_final_response("已经创建了歌单。", [preview], TOOLS)
+
+    assert violation is not None
+    assert violation.code == "smart_playlist_not_saved"
+
+
+def test_indirect_draft_edit_claim_cannot_hide_a_failed_tool_call():
+    invalid = ToolMessage(content='{"status":"invalid","error":"bad arguments"}',
+        tool_call_id="edit", name="manage_playlist_draft")
+    read = ToolMessage(content='{"status":"draft","action":"read","draft":{"id":"d","revision":0}}',
+        tool_call_id="read", name="manage_playlist_draft")
+    text = "抱歉，系统无法直接删除。根据您的要求，我已将第三首《歌曲》从草稿中移除，其他歌曲保留。"
+    violation = validate_final_response(text, [invalid, read], TOOLS)
+    assert violation.code == "draft_edit_unconfirmed"
+    assert validate_final_response(text, [], TOOLS).code == "draft_edit_unconfirmed"
+    old = ToolMessage(content='{"status":"draft","draft":{"id":"d","status":"draft","revision":0}}',
+        tool_call_id="old", name="create_smart_playlist")
+    recovery = safe_protocol_response(violation, [old, invalid, read])
+    assert "未得到成功回执" in recovery
+    assert "已更新" not in recovery
+
+
+def test_smart_playlist_saved_result_allows_created_claim():
+    saved = ToolMessage(
+        content=json.dumps(
+            {
+                "status": "created",
+                "batch_id": "smart-1",
+                "playlist": {"id": "playlist-1", "name": "夜跑"},
+            },
+            ensure_ascii=False,
+        ),
+        tool_call_id="call-smart",
+        name="create_smart_playlist",
+    )
+
+    assert validate_final_response("已经创建了歌单。", [saved], TOOLS) is None
+
+
+def test_smart_append_claims_update_not_creation_or_completed_downloads():
+    saved = ToolMessage(content=json.dumps({"status": "queued", "target_playlist_id": "p",
+        "playlist": {"id": "p", "name": "歌单一", "added_count": 2},
+        "job": {"id": "j", "status": "queued"}}), tool_call_id="smart", name="create_smart_playlist")
+    assert validate_final_response("已经加入歌单。", [saved], TOOLS) is None
+    violation = validate_final_response("已经创建了歌单。", [saved], TOOLS)
+    assert violation.code == "smart_playlist_append_not_create"
+    text = safe_protocol_response(violation, [saved])
+    assert "已更新" in text
+    assert "2 首本地歌曲" in text
+    assert "后台下载" in text
+    violation = validate_final_response('已成功为"歌单一"添加10首歌，其中8首正在下载。', [saved], TOOLS)
+    assert violation.code == "playlist_addition_pending"
+
+
+def test_smart_playlist_queued_download_cannot_be_claimed_complete():
+    queued = ToolMessage(content=json.dumps({"status": "queued", "playlist": {"id": "p", "name": "音乐"},
+        "job": {"id": "j", "status": "queued"}}), tool_call_id="smart", name="create_smart_playlist")
+    violation = validate_final_response("下载成功。", [queued], TOOLS)
+    assert violation.code == "download_still_queued"
+
+
+def test_smart_playlist_needing_download_cannot_be_claimed_playing():
+    pending = ToolMessage(content=json.dumps({"status": "needs_download", "result_count": 2}),
+        tool_call_id="smart", name="create_smart_playlist")
+    violation = validate_final_response("已经开始播放。", [pending], TOOLS)
+    assert violation.code == "smart_playlist_needs_download"
+
+
+def test_failed_draft_edit_cannot_claim_removed_song():
+    failure = ToolMessage(content="Error invoking tool: item_ids should be a valid list", tool_call_id="edit", name="manage_playlist_draft")
+    violation = validate_final_response("已移除草稿中的第三首，其余不变。", [failure], TOOLS)
+    assert violation.code == "draft_edit_unconfirmed"
+    assert "未得到成功回执" in safe_protocol_response(violation, [failure])
+
+
+def test_successful_draft_edit_requires_revision_receipt():
+    success = ToolMessage(content=json.dumps({"status": "draft", "action": "remove", "previous_revision": 0,
+        "draft": {"id": "d", "status": "draft", "revision": 1, "items": []}}), tool_call_id="edit", name="manage_playlist_draft")
+    assert validate_final_response("已移除草稿中的第三首，尚未保存。", [success], TOOLS) is None
+
+
+def test_draft_creation_cannot_claim_playlist_saved():
+    draft = ToolMessage(content=json.dumps({"status": "draft", "draft": {"status": "draft", "revision": 0}}), tool_call_id="preview", name="create_smart_playlist")
+    assert validate_final_response("歌单已保存。", [draft], TOOLS).code == "smart_playlist_not_saved"
+
+
+def test_read_after_success_does_not_discard_edit_or_save_receipt():
+    draft = {"id": "d", "status": "draft", "revision": 1}
+    edit = ToolMessage(content=json.dumps({"action": "remove", "previous_revision": 0, "draft": draft}), tool_call_id="edit", name="manage_playlist_draft")
+    read = ToolMessage(content=json.dumps({"action": "read", "draft": draft}), tool_call_id="read", name="manage_playlist_draft")
+    assert validate_final_response("已移除草稿第三首。", [edit, read], TOOLS) is None
+    save = ToolMessage(content=json.dumps({"action": "confirm", "status": "saved", "draft": {**draft, "status": "saved"}, "playlist": {"id": "p"}}), tool_call_id="save", name="manage_playlist_draft")
+    assert validate_final_response("草稿已保存，歌单已更新。", [save, read], TOOLS) is None

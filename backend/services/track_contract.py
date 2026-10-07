@@ -65,7 +65,7 @@ def track_cards_from_tool_result(tool_name: str, raw: Any) -> list[dict[str, Any
                     cards.append(TrackCard.model_validate(item))
                 except (TypeError, ValueError):
                     continue
-    elif tool_name == "convert_video":
+    elif tool_name in {"convert_video", "create_smart_playlist"}:
         raw_tracks = payload.get("tracks", [])
         if isinstance(raw_tracks, list):
             for item in raw_tracks:
@@ -75,4 +75,9 @@ def track_cards_from_tool_result(tool_name: str, raw: Any) -> list[dict[str, Any
                     cards.append(local_track_card(Track.model_validate(item)))
                 except (TypeError, ValueError):
                     continue
+        for remote in payload.get("remote_candidates", []):
+            if isinstance(remote, dict):
+                card = remote_track_card(remote)
+                if card:
+                    cards.append(card)
     return [card.model_dump(mode="json") for card in cards]

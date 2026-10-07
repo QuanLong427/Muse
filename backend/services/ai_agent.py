@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, AsyncGenerator, List, Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -23,6 +23,7 @@ from services.agent_protocol import (
     validate_final_response,
 )
 from services.llm_client import create_chat_model
+from services.agent_outcomes import ExecutionBudgetExceeded, interrupted_response
 from services.skill_loader import discover_skills, load_skill, load_skill_resource
 from services.memory_manager import (
     append_history,
@@ -33,6 +34,7 @@ from services.memory_manager import (
     sync_profile_projection,
 )
 from services.episode_memory import archive_turn_episode, serialize_tool_result
+from services.agent_context import ContextBuilder, memory_text
 from services.track_contract import (
     local_track_card,
     remote_track_card,
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 def _search_bilibili_with_retry(keyword: str, max_attempts: int = 2) -> dict[str, Any]:
     """Return a structured Bilibili search result with bounded transient retry."""
     import httpx
-    from services.bili_client import search_videos
+    from services.bili_client import search_with_network_policy
 
     normalized_keyword = keyword.strip()
     if not normalized_keyword:
@@ -72,10 +74,11 @@ def _search_bilibili_with_retry(keyword: str, max_attempts: int = 2) -> dict[str
     for attempt in range(1, attempts + 1):
         try:
             async def _search():
-                async with httpx.AsyncClient(timeout=30) as client:
-                    return await search_videos(client, normalized_keyword)
+                return await search_with_network_policy(normalized_keyword)
 
             result = asyncio.run(_search())
+            if result.get("error_code") == "bilibili_transient_error" and attempt < attempts:
+                continue
             normalized_videos = []
             for video in result.get("videos", []):
                 if hasattr(video, "model_dump"):
@@ -83,9 +86,9 @@ def _search_bilibili_with_retry(keyword: str, max_attempts: int = 2) -> dict[str
                 if isinstance(video, dict):
                     normalized_videos.append(video)
             return {
-                "status": "ok",
-                "attempts": attempt,
+                "status": result.get("status", "ok"),
                 **result,
+                "attempts": attempt,
                 "videos": normalized_videos,
             }
         except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -145,7 +148,7 @@ _BASE_PROMPT = """你是 Musicer 的 AI 音频助手。使用简洁、自然的�
 - 推荐候选可以来自偏好推理，但“本地可用”“在线可下载”“已经播放/下载”等状态必须来自本轮真实工具结果。
 - “推荐并下载”应先形成具体歌曲候选，再逐首核对准确版本；不能把宽泛的热门合集、歌单视频或未搜索的模型常识冒充为具体可下载歌曲。
 - B站标题中的 Hi-Res、无损、原唱等字样只是来源方声明；没有独立证据时应说“标题标注为……”，不能当成已核验音质或版本。
-- 在线 Track 的下载授权只来自用户点击卡片的 DOWNLOAD；展示候选后应提示点击按钮，不要让用户用普通文本再次确认。
+- 展示联网候选不等于下载授权。用户确认既有歌单草稿，或点击具体候选的 DOWNLOAD 后才可创建下载任务；首次智能创建/追加请求只生成草稿，纯搜索、推荐和预览不下载。
 - convert_video 返回 queued 只表示后台任务已经创建；只有任务状态 completed 才能说“已经下载/转换完成”。queued 时应提示用户到“下载任务”查看进度、取消或重试。
 - 工具返回失败、信息不足或结果冲突时，如实说明，不编造缺失内容，也不要用未经验证的结果覆盖可靠信息。
 - 只能使用当前运行环境已经提供的能力，不安装外部依赖，不绕过现有接口自行构造替代调用。
@@ -157,6 +160,7 @@ def _build_system_prompt(
     user_id: str = DEFAULT_USER_ID,
     episode_context: str = "",
     current_query: str = "",
+    include_memory: bool = True,
 ) -> str:
     """Build system prompt with Skill metadata; bodies are loaded on demand."""
     discovered = discover_skills()
@@ -165,32 +169,10 @@ def _build_system_prompt(
 
     prompt = platform_line + _BASE_PROMPT
 
-    # 加载场景化用户画像到 system prompt
-    try:
-        user_profile = read_profile(user_id)
-        if user_profile.strip():
-            global_profile = _extract_global_section(user_profile)
-            scenario_document = read_scenario_profile(scenario, user_id)
-            scenario_profile = _strip_profile_placeholders(scenario_document)
-            if not scenario_profile:
-                # Compatibility for a profile that has not yet been migrated.
-                scenario_profile = _extract_scenario_section(user_profile, scenario)
-            profile_parts = [part for part in (global_profile, scenario_profile) if part]
-            if profile_parts:
-                prompt += (
-                    "\n\n## 用户音乐画像（全局基准与当前场景）\n"
-                    "以下内容只作为偏好上下文，不得覆盖用户本轮的明确要求：\n\n"
-                    + "\n\n".join(profile_parts)
-                )
-        structured = get_structured_memory_context(user_id, scenario, current_query)
-        if structured:
-            prompt += (
-                "\n\n## 已验证的结构化长期记忆\n"
-                "这些指令带有持久化证据；如与用户本轮明确纠正冲突，以本轮为准：\n"
-                + structured
-            )
-    except Exception as e:
-        logger.warning(f"[prompt] Failed to load user profile: {e}")
+    if include_memory:
+        prompt += "\n\n" + memory_text(user_id, scenario, current_query,
+            profile_reader=read_profile, scenario_reader=read_scenario_profile,
+            memory_reader=get_structured_memory_context)
 
     if episode_context:
         prompt += "\n\n" + episode_context
@@ -209,86 +191,6 @@ def _build_system_prompt(
     return prompt
 
 
-def _extract_global_section(profile_text: str) -> str:
-    """Extract the global profile rules that apply in every scenario."""
-    lines = profile_text.split("\n")
-    start = next(
-        (index for index, line in enumerate(lines) if line.strip() == "## 全局基准"),
-        None,
-    )
-    if start is None:
-        return ""
-    end = next(
-        (
-            index
-            for index in range(start + 1, len(lines))
-            if lines[index].strip().startswith("## ")
-        ),
-        len(lines),
-    )
-    return _strip_profile_placeholders("\n".join(lines[start:end]))
-
-
-def _strip_profile_placeholders(section: str) -> str:
-    """Prevent template examples from becoming real user preferences."""
-    placeholder_tokens = (
-        "[例如：",
-        "[类型名称",
-        "[歌手",
-        "[乐队",
-        "[作曲家",
-        "[歌名]",
-        "[流派]",
-        "[意图]",
-        "[日期]",
-        "XX%",
-    )
-    lines = [
-        line for line in section.splitlines()
-        if not any(token in line for token in placeholder_tokens)
-    ]
-    return "\n".join(lines).strip()
-
-
-def _extract_scenario_section(profile_text: str, scenario: str = "默认") -> str:
-    """Extract the matching scenario section from user_profile.md.
-
-    Falls back to '默认' if the specified scenario is not found.
-    """
-    target = scenario or "默认"
-    lines = profile_text.split("\n")
-
-    start = None
-    end = None
-    fallback_start = None
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("## 场景:"):
-            sname = stripped.replace("## 场景:", "").strip()
-            if sname == target:
-                start = i
-            elif sname == "默认" and fallback_start is None:
-                fallback_start = i
-            elif start is not None and end is None:
-                end = i
-
-    if start is None:
-        start = fallback_start
-    if start is None:
-        return ""
-
-    if end is None:
-        for i in range(start + 1, len(lines)):
-            if lines[i].strip().startswith("## "):
-                end = i
-                break
-        if end is None:
-            end = len(lines)
-
-    return _strip_profile_placeholders("\n".join(lines[start:end]))
-
-
 # ── LangGraph Agent ─────────────────────────────────────────────────────────
 
 class AgentState(TypedDict, total=False):
@@ -297,6 +199,12 @@ class AgentState(TypedDict, total=False):
     protocol_status: str
     protocol_repairs: int
     protocol_issue: str
+    agent_steps: int
+    budget_exhausted: bool
+
+
+# Reserve graph steps for ACK handling, final reporting and one protocol repair.
+MAX_AGENT_TOOL_ROUNDS = 12
 
 
 def _build_tools(
@@ -306,6 +214,7 @@ def _build_tools(
     session_id: str = "default",
     current_message_id: int | None = None,
     selected_tracks: list[dict[str, Any]] | None = None,
+    current_request: str = "",
 ) -> list:
     """Build LangChain tools for the agent."""
 
@@ -328,9 +237,9 @@ def _build_tools(
         )
         return json.dumps(
             {
+                **result_fields,
                 "status": "dispatched",
                 "action_id": issued["id"],
-                **result_fields,
                 "client_action": issued["payload"],
             },
             ensure_ascii=False,
@@ -592,7 +501,11 @@ def _build_tools(
 
     @tool
     def add_track_to_music_playlist(playlist_id: str, track_id: str) -> str:
-        """Add one exact local track to a named playlist without changing current playback."""
+        """Add one user-selected exact local track, not automatically choose many songs.
+
+        For automatic playlist filling use the smart-playlist Skill and
+        create_smart_playlist(target_playlist_id=...). This tool never downloads.
+        """
         from services.music_library_store import add_playlist_track, get_playlist
         from services.music_manager import find_track_by_id
 
@@ -608,7 +521,8 @@ def _build_tools(
             expected_revision=playlist["revision"],
             user_id=user_id,
         )
-        return json.dumps({"status": "added", "playlist": updated}, ensure_ascii=False)
+        added = len(updated["items"]) - len(playlist["items"])
+        return json.dumps({"status": "added" if added else "unchanged", "added_count": added, "playlist": updated}, ensure_ascii=False)
 
     @tool
     def play_music_playlist(playlist_id: str) -> str:
@@ -1085,6 +999,219 @@ def _build_tools(
         return json.dumps(result, ensure_ascii=False, default=str)
 
     @tool
+    def create_smart_playlist(
+        action: Literal["preview", "play", "save"] = "preview",
+        name: str = "",
+        count: int = 0,
+        duration_minutes: float = 0,
+        query: str = "",
+        include_artists: str = "",
+        exclude_artists: str = "",
+        genre: str = "",
+        mood: str = "",
+        language: str = "",
+        exclude_versions: str = "",
+        energy_curve: str = "",
+        accept_warnings: bool = False,
+        source_policy: Literal["balanced", "local", "cloud"] = "balanced",
+        preview_batch_id: str = "",
+        target_playlist_id: str = "",
+    ) -> str:
+        """Generate an editable chat smart-playlist DRAFT, never save on creation.
+
+        Use for automatic song selection, including '帮我加入10首歌到刚刚创建的歌单'.
+        count means NEW songs to add, not total playlist size. Resolve the exact
+        existing playlist ID from history or list_music_playlists and pass
+        target_playlist_id; never create a same-name replacement or copy playback.
+        ``preview`` and compatibility ``save`` both create a draft without
+        downloading or changing named playlists. Explicit later confirmation
+        uses manage_playlist_draft with the exact draft_id and revision.
+        ``play`` is only for an explicit playback request and needs a real ACK.
+        Pass preview_batch_id to turn an existing preview into a draft.
+        Artist/version fields accept
+        comma-separated values. The result discloses constraints that could
+        not be verified because the local catalog lacks audio metadata. A
+        result with warnings remains a preview unless the user explicitly
+        accepted those limitations and ``accept_warnings`` is true.
+        """
+        from services.smart_playlist_service import generate_smart_playlist
+        from services.music_library_store import PlaylistRevisionConflictError
+
+        if target_playlist_id and action == "play":
+            return json.dumps({"status": "invalid", "error": "追加歌单不改变播放内容，请使用 preview 或 save。"}, ensure_ascii=False)
+
+        if "smart-playlist" not in activated_skills:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": "skill_activation_required",
+                    "required_skill": "smart-playlist",
+                    "retryable": True,
+                    "error": "请先加载 smart-playlist Skill，再生成智能歌单。",
+                },
+                ensure_ascii=False,
+            )
+
+        if action == "save" and preview_batch_id:
+            try:
+                from services.playlist_draft_service import create_draft
+                draft = create_draft({"batch_id": preview_batch_id}, user_id=user_id, session_id=session_id, name=name)
+                return json.dumps({"status": "draft", "draft": draft, "notice": "尚未保存或下载，请调整草稿后明确确认。"}, ensure_ascii=False, default=str)
+            except (LookupError, ValueError, PlaylistRevisionConflictError) as exc:
+                return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+
+        def parse_values(raw: str) -> list[str]:
+            raw = raw.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    decoded = json.loads(raw)
+                    if isinstance(decoded, list):
+                        return [str(value).strip() for value in decoded if str(value).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [
+                value.strip()
+                for value in re.split(r"[,，、;；\n]+", raw)
+                if value.strip()
+            ]
+
+        try:
+            result = generate_smart_playlist(
+                user_id=user_id,
+                scenario=scenario,
+                count=count if count > 0 else None,
+                duration_minutes=duration_minutes if duration_minutes > 0 else None,
+                query=query,
+                include_artists=parse_values(include_artists),
+                exclude_artists=parse_values(exclude_artists),
+                genre=genre,
+                mood=mood,
+                language=language,
+                exclude_versions=parse_values(exclude_versions),
+                energy_curve=energy_curve,
+                source_policy=source_policy,
+                cloud_search=_search_bilibili_with_retry,
+                target_playlist_id=target_playlist_id,
+            )
+        except (LookupError, ValueError) as exc:
+            return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+        tracks = [track for track in result.get("tracks", []) if isinstance(track, dict)]
+        for raw_track in tracks:
+            try:
+                from models import Track
+
+                card = local_track_card(Track.model_validate(raw_track))
+            except (TypeError, ValueError):
+                continue
+            serialized = card.model_dump(mode="json")
+            track_registry[card.track_id] = serialized
+            if card.bvid:
+                track_registry[card.bvid] = serialized
+
+        for remote in result.get("remote_candidates", []):
+            card = remote_track_card(remote)
+            if card:
+                track_registry[card.track_id] = card.model_dump(mode="json")
+                track_registry[card.bvid] = card.model_dump(mode="json")
+
+        if not (result.get("result_count") or tracks or result.get("remote_candidates")):
+            return json.dumps(result, ensure_ascii=False, default=str)
+        if action != "play":
+            from services.playlist_draft_service import create_draft
+            try:
+                draft = create_draft(result, user_id=user_id, session_id=session_id, name=name)
+            except (LookupError, ValueError) as exc:
+                return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+            return json.dumps({**result, "status": "draft", "draft": draft,
+                "notice": "草稿尚未保存；用户调整后点击确认或明确确认添加，才会保存并下载联网歌曲。"}, ensure_ascii=False, default=str)
+        if action == "play" and result.get("warnings") and not accept_warnings:
+            return json.dumps(
+                {
+                    **result,
+                    "status": "needs_confirmation",
+                    "error": "存在未满足或无法核验的约束，已保留预览且未执行写入或播放",
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        if action == "play":
+            if result.get("remote_candidates"):
+                return json.dumps({**result, "status": "needs_download",
+                    "error": "预览含联网歌曲，请先添加为歌单以下载；下载完成后再播放该歌单。"}, ensure_ascii=False)
+            if not player_snapshot.get("available", False):
+                return json.dumps(
+                    {
+                        **result,
+                        "status": "unavailable",
+                        "error": "智能歌单预览已生成，但当前请求没有可控制的浏览器播放器",
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            return dispatch_player_action(
+                {
+                    "target": "player",
+                    "action": "play_collection",
+                    "tracks": tracks,
+                    "origin_type": "smart_playlist",
+                    "origin_id": result.get("batch_id"),
+                },
+                **result,
+            )
+        return json.dumps(result, ensure_ascii=False, default=str)
+
+    @tool
+    def manage_playlist_draft(
+        action: Literal["list", "read", "rename", "remove", "reorder", "replace", "add", "filter_versions", "cancel", "confirm"],
+        draft_id: str = "", expected_revision: int = -1, name: str = "",
+        item_ids: str = "", track_id: str = "",
+        candidate_batch_id: str = "", candidate_track_id: str = "", exclude_versions: str = "",
+    ) -> str:
+        """Read/edit the SAME chat playlist draft, or explicitly confirm its exact revision.
+
+        Obtain draft_id, revision and item_ids from context/list/read, never guess.
+        item_ids and exclude_versions are JSON-encoded string arrays, e.g.
+        item_ids='["exact-item-id"]'; HTTP endpoints use native arrays instead.
+        replace/add accepts a canonical local track_id, an audited candidate batch
+        and track ID, or selects a new candidate under the draft's constraints.
+        Editing never downloads. confirm is allowed only when the CURRENT user
+        message explicitly confirms saving an existing draft; creating a playlist
+        is not confirmation. Multiple pending drafts require a named selection.
+        """
+        from services.playlist_draft_service import list_drafts, get_draft, edit_draft, confirm_draft
+        from services.music_library_store import PlaylistRevisionConflictError
+        try:
+            def string_array(raw):
+                if not raw:
+                    return []
+                values = json.loads(raw)
+                if not isinstance(values, list) or len(values) > 50 or any(not isinstance(value, str) for value in values):
+                    raise ValueError("参数必须是 JSON 字符串数组")
+                return values
+            if action == "list":
+                return json.dumps({"status": "ok", "action": action, "drafts": list_drafts(user_id, session_id)}, ensure_ascii=False, default=str)
+            draft = get_draft(draft_id, user_id, session_id)
+            if action == "read":
+                return json.dumps({"status": draft["status"], "action": action, "draft": draft}, ensure_ascii=False, default=str)
+            if action == "confirm":
+                from services.playlist_draft_service import confirmation_allowed
+                if not confirmation_allowed(current_request, draft, list_drafts(user_id, session_id)):
+                    return json.dumps({"status": "confirmation_required", "error": "本轮尚未明确确认这份草稿；请用户点击确认，或明确确认添加指定草稿。"}, ensure_ascii=False)
+                updated = confirm_draft(draft_id, user_id=user_id, session_id=session_id, expected_revision=expected_revision)
+                receipt = updated["receipt"]
+                return json.dumps({"status": "queued" if receipt.get("download_job") else "saved", "action": action, "draft": updated,
+                    "playlist": receipt, "job": receipt.get("download_job"), "target_playlist_id": updated["target_playlist_id"]}, ensure_ascii=False, default=str)
+            updated = edit_draft(draft_id, user_id=user_id, session_id=session_id,
+                expected_revision=expected_revision, action=action, name=name, item_ids=string_array(item_ids),
+                track_id=track_id, candidate_batch_id=candidate_batch_id, candidate_track_id=candidate_track_id,
+                exclude_versions=string_array(exclude_versions), cloud_search=_search_bilibili_with_retry)
+            return json.dumps({"status": updated["status"], "draft": updated, "action": action, "previous_revision": expected_revision}, ensure_ascii=False, default=str)
+        except (LookupError, ValueError, PlaylistRevisionConflictError) as exc:
+            return json.dumps({"status": "invalid", "error": str(exc)}, ensure_ascii=False)
+
+    @tool
     def bili_search(keyword: str) -> str:
         """Search Bilibili for videos by a specific keyword.
 
@@ -1244,8 +1371,8 @@ def _build_tools(
 
         Returns a persistent background job immediately. The UI can observe
         progress, cancel, and retry through the download-jobs API. Successful
-        items register their minimum source identity in LLM-Wiki; semantic
-        enrichment remains a separate llm-wiki workflow.
+        items register their source identity and queue background evidence-
+        validated Wiki construction; download and knowledge status are separate.
         """
         from services.bili_downloader import extract_bvid
 
@@ -1429,6 +1556,8 @@ def _build_tools(
         get_recent_music_preferences,
         recommend_next,
         recommend_music,
+        create_smart_playlist,
+        manage_playlist_draft,
         explain_recommendation,
         bili_search,
         local_search,
@@ -1450,6 +1579,8 @@ def _build_agent(
     session_id: str = "default",
     current_message_id: int | None = None,
     selected_tracks: list[dict[str, Any]] | None = None,
+    current_request: str = "",
+    context_builder: ContextBuilder | None = None,
 ):
     """Build a LangGraph React Agent with the given system prompt."""
     llm = create_chat_model(
@@ -1465,6 +1596,7 @@ def _build_agent(
         session_id=session_id,
         current_message_id=current_message_id,
         selected_tracks=selected_tracks,
+        current_request=current_request,
     )
     llm_with_tools = llm.bind_tools(tools)
     registered_tool_names = [tool.name for tool in tools]
@@ -1473,6 +1605,8 @@ def _build_agent(
         """Agent node: call LLM with tools."""
         messages = state["messages"]
         full_messages = [SystemMessage(content=system_prompt)] + list(messages)
+        if context_builder is not None:
+            full_messages.insert(1, SystemMessage(content=context_builder.runtime_text()))
         action_results = state.get("client_action_results", {})
         if action_results:
             receipts = [
@@ -1493,8 +1627,14 @@ def _build_agent(
                     )
                 )
             )
+        steps = int(state.get("agent_steps", 0))
+        if steps >= MAX_AGENT_TOOL_ROUNDS:
+            events = [{"phase": "result", "name": item.name, "content": item.content}
+                      for item in messages if isinstance(item, ToolMessage)]
+            return {"messages": [AIMessage(content=interrupted_response(events, error=ExecutionBudgetExceeded()))],
+                    "agent_steps": steps + 1, "budget_exhausted": True}
         response = llm_with_tools.invoke(full_messages)
-        return {"messages": [response]}
+        return {"messages": [response], "agent_steps": steps + 1}
 
     tool_node = ToolNode(tools)
 
@@ -1521,6 +1661,8 @@ def _build_agent(
         return "validate"
 
     async def validate_node(state: AgentState) -> dict:
+        if state.get("budget_exhausted"):
+            return {"protocol_status": "interrupted", "protocol_issue": "execution_budget_exhausted"}
         last_message = state["messages"][-1]
         text = last_message.content if isinstance(last_message, AIMessage) else ""
         if not isinstance(text, str):
@@ -1691,7 +1833,9 @@ async def chat_stream(
     episode_message_ids: list[int] = []
     tool_events: list[dict[str, Any]] = []
     presented_track_cards: list[dict[str, Any]] = []
+    playlist_draft_ids: list[str] = []
     retrieved_episode_ids: list[str] = []
+    client_action_results: dict[str, dict] = {}
     episode_archived = False
     try:
         current_message_id = append_history(
@@ -1719,7 +1863,10 @@ async def chat_stream(
             user_id,
             episode_context=episode_context["text"],
             current_query=message,
+            include_memory=False,
         )
+        context_builder = ContextBuilder(user_id=user_id, session_id=session_id,
+            scenario=scenario, query=message, player_state=player_state)
         agent = _build_agent(
             system_prompt,
             scenario,
@@ -1728,6 +1875,8 @@ async def chat_stream(
             session_id=session_id,
             current_message_id=current_message_id,
             selected_tracks=selected_tracks,
+            current_request=message,
+            context_builder=context_builder,
         )
     except Exception as e:
         try:
@@ -1741,6 +1890,8 @@ async def chat_stream(
                 final_text="",
                 player_state=player_state,
                 retrieved_episode_ids=retrieved_episode_ids,
+                client_action_results=client_action_results,
+                selected_tracks=selected_tracks,
                 error=f"Agent init failed: {e}",
             )
             episode_archived = True
@@ -1788,6 +1939,9 @@ async def chat_stream(
             elif kind == "on_chain_end":
                 output = event.get("data", {}).get("output")
                 if isinstance(output, dict):
+                    returned_actions = output.get("client_action_results")
+                    if isinstance(returned_actions, dict):
+                        client_action_results.update(returned_actions)
                     output_protocol_status = output.get("protocol_status")
                     if isinstance(output_protocol_status, str) and output_protocol_status:
                         protocol_status = output_protocol_status
@@ -1832,7 +1986,7 @@ async def chat_stream(
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown")
                 tool_output = event.get("data", {}).get("output", "")
-                serialized_output = _tool_output_text(tool_output, limit=4000)
+                serialized_output = _tool_output_text(tool_output, limit=200000)
                 tool_events.append(
                     {
                         "phase": "result",
@@ -1862,7 +2016,16 @@ async def chat_stream(
                             **client_action,
                         },
                     }
-                cards = track_cards_from_tool_result(tool_name, tool_output)
+                try:
+                    payload = json.loads(serialized_output)
+                except (ValueError, TypeError):
+                    payload = {}
+                draft = payload.get("draft") if isinstance(payload, dict) else None
+                if isinstance(draft, dict) and draft.get("id"):
+                    if draft["id"] not in playlist_draft_ids:
+                        playlist_draft_ids.append(draft["id"])
+                    yield {"event": "output", "data": {"type": "playlist_draft", "draft": draft}}
+                cards = [] if draft else track_cards_from_tool_result(tool_name, tool_output)
                 if cards:
                     known_ids = {card.get("track_id") for card in presented_track_cards}
                     presented_track_cards.extend(
@@ -1881,7 +2044,8 @@ async def chat_stream(
                     "data": {
                         "type": "tool_result",
                         "name": tool_name,
-                        "content": _tool_output_text(tool_output, limit=2000),
+                        # Do not truncate JSON: the frontend consumes playlist/job receipts.
+                        "content": serialized_output,
                     },
                 }
 
@@ -1891,7 +2055,7 @@ async def chat_stream(
                 "event": "output",
                 "data": {
                     "type": "result",
-                    "subtype": "success",
+                    "subtype": "partial" if protocol_status == "interrupted" else "success",
                     "result": final_text,
                     "protocol_status": protocol_status or "valid",
                 },
@@ -1911,6 +2075,7 @@ async def chat_stream(
                     session_id=session_id,
                     metadata={
                         "track_cards": presented_track_cards,
+                        "playlist_draft_ids": playlist_draft_ids,
                         "protocol_status": protocol_status or "valid",
                         "protocol_issue": protocol_issue,
                     },
@@ -1932,9 +2097,11 @@ async def chat_stream(
                 final_text=final_text,
                 player_state=player_state,
                 retrieved_episode_ids=retrieved_episode_ids,
+                client_action_results=client_action_results,
+                selected_tracks=selected_tracks,
                 error=(
                     f"agent_protocol_blocked:{protocol_issue or 'unknown'}"
-                    if protocol_status == "blocked"
+                    if protocol_status in {"blocked", "interrupted"}
                     else None
                 ),
             )
@@ -1942,9 +2109,21 @@ async def chat_stream(
         except Exception:
             logger.exception("[memory] failed to archive completed episode")
 
-        yield {"event": "done", "data": {"status": "completed"}}
+        yield {"event": "done", "data": {"status": "interrupted" if protocol_status == "interrupted" else "completed"}}
 
     except Exception as e:
+        # Never repeat writes after an interrupted turn. Report observed receipts
+        # without another LLM call; the model or provider may be unavailable.
+        final_text = interrupted_response(tool_events, error=e)
+        try:
+            agent_message_id = append_history(
+                role="agent", content=final_text, summary=final_text[:100],
+                scenario=scenario, user_id=user_id, session_id=session_id,
+                metadata={"track_cards": presented_track_cards, "playlist_draft_ids": playlist_draft_ids, "protocol_status": "interrupted", "protocol_issue": type(e).__name__},
+            )
+            episode_message_ids.append(agent_message_id)
+        except Exception:
+            logger.exception("[memory] failed to persist interrupted response")
         if not episode_archived:
             try:
                 archive_turn_episode(
@@ -1954,11 +2133,15 @@ async def chat_stream(
                     user_message=message,
                     source_message_ids=episode_message_ids,
                     tool_events=tool_events,
-                    final_text="",
+                    final_text=final_text,
                     player_state=player_state,
                     retrieved_episode_ids=retrieved_episode_ids,
+                    client_action_results=client_action_results,
+                    selected_tracks=selected_tracks,
                     error=str(e),
                 )
             except Exception:
                 logger.exception("[memory] failed to archive failed episode")
-        yield {"event": "error", "data": {"error": str(e)}}
+        logger.warning("[agent] turn interrupted: %s", type(e).__name__)
+        yield {"event": "output", "data": {"type": "result", "subtype": "partial", "result": final_text, "protocol_status": "interrupted"}}
+        yield {"event": "done", "data": {"status": "interrupted"}}
