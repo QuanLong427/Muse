@@ -6,6 +6,7 @@ import type {
   DownloadRequestTrack,
 } from "@/app/lib/types";
 import { apiUrl } from "@/app/lib/api";
+import { usePlaylists } from "@/app/context/PlaylistContext";
 import {
   createContext,
   useCallback,
@@ -13,6 +14,7 @@ import {
   useEffect,
   useMemo,
   useState,
+  useRef,
   type ReactNode,
 } from "react";
 
@@ -44,6 +46,8 @@ function errorMessage(payload: unknown, fallback: string) {
 }
 
 export function DownloadProvider({ children }: { children: ReactNode }) {
+  const { refresh: refreshPlaylists } = usePlaylists();
+  const previousPlaylistJobs = useRef("");
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -73,7 +77,17 @@ export function DownloadProvider({ children }: { children: ReactNode }) {
     void refresh();
   }, [refresh]);
 
-  const hasActiveJobs = jobs.some((job) => ACTIVE.has(job.status));
+  const hasActiveJobs = jobs.some((job) => ACTIVE.has(job.status) ||
+    ((job.result.wiki_sync as { jobs?: { enrichment_status?: string }[] } | undefined)?.jobs ?? [])
+      .some((item) => ["queued", "running"].includes(item.enrichment_status ?? "")));
+  const playlistJobVersion = jobs.filter((job) => job.target_playlist_id)
+    .map((job) => `${job.id}:${job.status}:${job.completed_items}`).join("|");
+  useEffect(() => {
+    if (playlistJobVersion !== previousPlaylistJobs.current) {
+      previousPlaylistJobs.current = playlistJobVersion;
+      void refreshPlaylists();
+    }
+  }, [playlistJobVersion, refreshPlaylists]);
   useEffect(() => {
     if (!hasActiveJobs) return;
     const timer = window.setInterval(() => void refresh(), 1000);

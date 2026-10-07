@@ -7,13 +7,15 @@ import { LocalLibrary } from "./LocalLibrary";
 import { MyPlaylists } from "./MyPlaylists";
 import { PlaybackDetails } from "./PlaybackDetails";
 import { RecentPlays } from "./RecentPlays";
+import { SmartPlaylistPanel } from "./SmartPlaylistPanel";
 
-type WorkspaceView = "library" | "recent" | "playlists" | "downloads" | "playback";
+type WorkspaceView = "library" | "recent" | "playlists" | "smart" | "downloads" | "playback";
 
 const views: Array<{ id: WorkspaceView; label: string }> = [
   { id: "library", label: "本地曲库" },
   { id: "recent", label: "最近播放" },
   { id: "playlists", label: "我的歌单" },
+  { id: "smart", label: "智能歌单" },
   { id: "downloads", label: "下载任务" },
   { id: "playback", label: "播放详情" },
 ];
@@ -23,7 +25,7 @@ export function MusicWorkspace() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
-      <nav aria-label="音乐库" className="grid shrink-0 grid-cols-5 overflow-hidden rounded-xl border border-[var(--glass-border)] bg-[rgba(255,255,255,0.04)]">
+      <nav aria-label="音乐库" className="grid shrink-0 grid-cols-6 overflow-hidden rounded-xl border border-[var(--glass-border)] bg-[rgba(255,255,255,0.04)]">
         {views.map((item) => (
           <button
             key={item.id}
@@ -40,6 +42,7 @@ export function MusicWorkspace() {
         {view === "library" && <LocalLibrary />}
         {view === "recent" && <RecentPlays />}
         {view === "playlists" && <MyPlaylists />}
+        {view === "smart" && <SmartPlaylistPanel />}
         {view === "downloads" && <DownloadsPanel />}
         {view === "playback" && (
           <>

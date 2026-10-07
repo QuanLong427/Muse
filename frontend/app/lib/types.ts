@@ -57,6 +57,7 @@ export interface DownloadJobItem {
 export interface DownloadJob {
   id: string;
   user_id: string;
+  target_playlist_id?: string | null;
   status: DownloadJobStatus;
   total_items: number;
   completed_items: number;
@@ -93,6 +94,22 @@ export interface ChatMessage {
   timestamp: number;
   toolName?: string;
   trackCards?: TrackCardData[];
+  playlistDraftIds?: string[];
+}
+
+export interface PlaylistDraft {
+  id: string;
+  user_id: string;
+  session_id: string;
+  revision: number;
+  status: "draft" | "confirming" | "saved" | "cancelled";
+  name: string;
+  target_playlist_id: string;
+  last_error: string;
+  local_tracks?: Record<string, Track>;
+  warnings: { code: string; message: string }[];
+  items: { item_id: string; track: Track & { source_type?: "bilibili"; video_title?: string; uploader?: string }; reasons: { detail: string }[] }[];
+  receipt: (SmartPlaylistSaveResult & { name: string }) | null;
 }
 
 export interface PlayerState {
@@ -163,6 +180,55 @@ export interface NamedPlaylist {
   created_at: string;
   updated_at: string;
   items: NamedPlaylistItem[];
+}
+
+export interface SmartPlaylistWarning {
+  code: string;
+  message: string;
+}
+
+export interface SmartPlaylistRecommendation {
+  track: Track | SmartPlaylistRemoteCandidate;
+  score: number;
+  reasons: Array<{
+    code: string;
+    detail: string;
+    evidence_score?: number;
+  }>;
+  duration_seconds: number;
+}
+
+export interface SmartPlaylistRemoteCandidate {
+  id: string;
+  title: string;
+  author: string;
+  bvid: string;
+  duration: string;
+  url: string;
+  uploader: string;
+  video_title: string;
+  source_type: "bilibili";
+}
+
+export type SmartPlaylistSaveResult = NamedPlaylist & {
+  download_job: DownloadJob | null;
+  import_status: string;
+};
+
+export interface SmartPlaylistPreview {
+  status: "ok" | "partial" | "empty";
+  batch_id: string | null;
+  scenario: string;
+  suggested_name: string;
+  tracks: Track[];
+  remote_candidates: SmartPlaylistRemoteCandidate[];
+  source_plan: { planned: { local: number; cloud: number }; actual: { local: number; cloud: number } };
+  recommendations: SmartPlaylistRecommendation[];
+  result_count: number;
+  estimated_duration_seconds: number;
+  duration_is_estimated: boolean;
+  constraints: Record<string, unknown>;
+  warnings: SmartPlaylistWarning[];
 }
 
 export interface RecentTrack {

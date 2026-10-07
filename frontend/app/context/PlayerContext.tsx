@@ -39,6 +39,13 @@ type PlayerCtx = {
     origin: PlaybackOrigin,
     originId?: string | null
   ) => void;
+  replaceCollectionWithUndo: (
+    tracks: Track[],
+    origin: PlaybackOrigin,
+    originId?: string | null
+  ) => void;
+  undoCollectionReplacement: () => boolean;
+  canUndoCollectionReplacement: boolean;
   addTracks: (
     tracks: Track[],
     origin?: PlaybackOrigin,
@@ -63,6 +70,19 @@ type PlayerCtx = {
 };
 
 const PlayerContext = createContext<PlayerCtx | null>(null);
+
+type SessionRestorePoint = {
+  items: PlaybackSessionItem[];
+  currentItemId: string | null;
+  orderMode: PlaybackOrderMode;
+  repeatMode: PlaybackRepeatMode;
+  historyItemIds: string[];
+  historyCursor: number;
+  shuffleBagItemIds: string[];
+  progress: number;
+  playing: boolean;
+  volume: number;
+};
 
 function newItemId(): string {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
@@ -112,6 +132,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   const [historyCursor, setHistoryCursor] = useState(-1);
   const [shuffleBagItemIds, setShuffleBagItemIds] = useState<string[]>([]);
   const [trackRemoved, setTrackRemoved] = useState(false);
+  const [canUndoCollectionReplacement, setCanUndoCollectionReplacement] = useState(false);
+  const collectionRestoreRef = useRef<SessionRestorePoint | null>(null);
 
   const itemsRef = useRef<PlaybackSessionItem[]>([]);
   const currentItemIdRef = useRef<string | null>(null);
@@ -707,6 +729,69 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     [commitNavigation, reportCurrentEvent, selectSessionItem]
   );
 
+  const replaceCollectionWithUndo = useCallback(
+    (tracks: Track[], origin: PlaybackOrigin, originId: string | null = null) => {
+      if (!tracks.length) return;
+      collectionRestoreRef.current = {
+        items: itemsRef.current.map((item) => ({ ...item, track: { ...item.track } })),
+        currentItemId: currentItemIdRef.current,
+        orderMode: orderModeRef.current,
+        repeatMode: repeatModeRef.current,
+        historyItemIds: [...historyItemIdsRef.current],
+        historyCursor: historyCursorRef.current,
+        shuffleBagItemIds: [...shuffleBagItemIdsRef.current],
+        progress,
+        playing,
+        volume,
+      };
+      setCanUndoCollectionReplacement(true);
+      playCollection(tracks, origin, originId);
+    },
+    [playCollection, playing, progress, volume]
+  );
+
+  const undoCollectionReplacement = useCallback(() => {
+    const restore = collectionRestoreRef.current;
+    if (!restore) return false;
+    collectionRestoreRef.current = null;
+    setCanUndoCollectionReplacement(false);
+    if (currentItemIdRef.current) reportCurrentEvent("play_stopped");
+
+    const restoredItems = restore.items.map((item) => ({
+      ...item,
+      track: { ...item.track },
+    }));
+    itemsRef.current = restoredItems;
+    setItems(restoredItems);
+    currentItemIdRef.current = restore.currentItemId;
+    setCurrentItemId(restore.currentItemId);
+    setOrderModeState(restore.orderMode);
+    orderModeRef.current = restore.orderMode;
+    setRepeatModeState(restore.repeatMode);
+    repeatModeRef.current = restore.repeatMode;
+    commitNavigation(
+      restore.historyItemIds,
+      restore.historyCursor,
+      restore.shuffleBagItemIds
+    );
+    setVolume(restore.volume);
+
+    const restoredCurrent = restoredItems.find(
+      (item) => item.id === restore.currentItemId
+    );
+    if (restoredCurrent) {
+      startTrackAudio(restoredCurrent.track, restore.progress, restore.playing);
+    } else {
+      pause();
+      const element = audioRef.current;
+      if (element) {
+        element.removeAttribute("src");
+        element.load();
+      }
+    }
+    return true;
+  }, [audioRef, commitNavigation, pause, reportCurrentEvent, setVolume, startTrackAudio]);
+
   const next = useCallback(() => advancePlayback("manual"), [advancePlayback]);
 
   const prev = useCallback(() => {
@@ -864,6 +949,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       state,
       playTrack,
       playCollection,
+      replaceCollectionWithUndo,
+      undoCollectionReplacement,
+      canUndoCollectionReplacement,
       addTracks,
       removeSessionItem,
       insertNext,
@@ -882,7 +970,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       trackRemoved,
       clearTrackRemoved,
     }),
-    [addTracks, audioRef, clearSession, clearTrackRemoved, insertNext, next, pause, playCollection, playCurrent, playTrack, prev, removeSessionItem, reorderSession, seek, setPlaybackMode, setVolume, state, stop, togglePlay, trackRemoved]
+    [addTracks, audioRef, canUndoCollectionReplacement, clearSession, clearTrackRemoved, insertNext, next, pause, playCollection, playCurrent, playTrack, prev, removeSessionItem, reorderSession, replaceCollectionWithUndo, seek, setPlaybackMode, setVolume, state, stop, togglePlay, trackRemoved, undoCollectionReplacement]
   );
 
   return (

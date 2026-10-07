@@ -6,6 +6,7 @@ export { MusicWorkspace } from "./MusicWorkspace";
 export { LocalLibrary } from "./LocalLibrary";
 export { RecentPlays } from "./RecentPlays";
 export { MyPlaylists } from "./MyPlaylists";
+export { SmartPlaylistPanel } from "./SmartPlaylistPanel";
 export { ParticleBackground } from "./ParticleBackground";
 export { Player } from "./Player";
 export { PlaybackDetails } from "./PlaybackDetails";

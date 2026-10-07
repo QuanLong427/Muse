@@ -1,5 +1,7 @@
 "use client";
 
+import { PlaylistDraftCard } from "./PlaylistDraftCard";
+
 import type { CSSProperties } from "react";
 import { useEffect, useMemo, useState } from "react";
 import type { Track, TrackCardData } from "@/app/lib/types";
@@ -489,6 +491,7 @@ export function ChatMessage({ message: m }: Props) {
           <span className="text-[10px] text-[color:var(--color-on-surface-muted)] opacity-60">{formatTs(m.timestamp)}</span>
         </div>
         {m.trackCards?.length ? <TrackCards cards={m.trackCards} /> : null}
+        {m.playlistDraftIds?.map((id) => <PlaylistDraftCard key={id} draftId={id} />)}
         {parts ? (
           <div className={isOp ? "text-right" : "text-left"}>
             {parts.map((part, i) => {

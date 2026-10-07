@@ -2,6 +2,7 @@
 
 import type { AgentState, ChatMessage, DownloadJob, Track, TrackCardData } from "@/app/lib/types";
 import { useDownloads } from "@/app/context/DownloadContext";
+import { usePlaylists } from "@/app/context/PlaylistContext";
 import { useMode } from "@/app/context/ModeContext";
 import { usePlayer } from "@/app/context/PlayerContext";
 import { useScenario } from "@/app/context/ScenarioContext";
@@ -139,6 +140,18 @@ function appendFromSdkPayload(
     return null;
   }
 
+  if (t === "playlist_draft" && d.draft && typeof d.draft === "object") {
+    const draft = d.draft as { id?: string };
+    if (draft.id) {
+      const draftId = draft.id;
+      window.dispatchEvent(new CustomEvent("musicer:draft-updated", { detail: draftId }));
+      setMessages((previous) => previous.some((m) => m.playlistDraftIds?.includes(draftId)) ? [...previous] : [
+        ...previous, { id: newId(), role: "agent", content: "", timestamp: ts, playlistDraftIds: [draftId] },
+      ]);
+    }
+    return null;
+  }
+
   if (t === "track_cards") {
     const tracks = d.tracks;
     if (!Array.isArray(tracks) || tracks.length === 0) return null;
@@ -155,7 +168,7 @@ function appendFromSdkPayload(
     return null;
   }
 
-  if (t === "result" && d.subtype === "success" && typeof d.result === "string") {
+  if (t === "result" && (d.subtype === "success" || d.subtype === "partial") && typeof d.result === "string") {
     const text = d.result.trim();
     const currentId = streamingIdRef.current;
     if (text.length) {
@@ -253,6 +266,7 @@ export function AgentProvider({
     deleteScenario,
   } = useScenario();
   const { registerJob } = useDownloads();
+  const { refresh: refreshPlaylists } = usePlaylists();
   const [voiceOutputEnabled, setVoiceOutputEnabled] = useState(false);
   const [voiceSpeaking, setVoiceSpeaking] = useState(false);
   const [voiceOutputError, setVoiceOutputError] = useState("");
@@ -272,6 +286,7 @@ export function AgentProvider({
     setVolume,
     playTrack,
     playCollection,
+    replaceCollectionWithUndo,
     addTracks,
     insertNext,
     removeSessionItem,
@@ -426,12 +441,26 @@ export function AgentProvider({
             )
         );
         if (!canonical.length) return false;
+        const origin =
+          actionData.origin_type === "playlist"
+            ? "playlist"
+            : actionData.origin_type === "smart_playlist"
+              ? "smart_playlist"
+              : "manual";
         await waitForAudioPlayback(audioRef.current, () => {
-          playCollection(
-            canonical,
-            actionData.origin_type === "playlist" ? "playlist" : "manual",
-            typeof actionData.origin_id === "string" ? actionData.origin_id : null
-          );
+          if (origin === "smart_playlist") {
+            replaceCollectionWithUndo(
+              canonical,
+              origin,
+              typeof actionData.origin_id === "string" ? actionData.origin_id : null
+            );
+          } else {
+            playCollection(
+              canonical,
+              origin,
+              typeof actionData.origin_id === "string" ? actionData.origin_id : null
+            );
+          }
         });
         break;
       }
@@ -530,7 +559,7 @@ export function AgentProvider({
         return false;
     }
     return true;
-  }, [addTracks, audioRef, clearSession, insertNext, pause, play, playCollection, playNext, playPrevious, playTrack, removeSessionItem, reorderSession, seek, setPlaybackMode, setVolume, stop]);
+  }, [addTracks, audioRef, clearSession, insertNext, pause, play, playCollection, playNext, playPrevious, playTrack, removeSessionItem, reorderSession, replaceCollectionWithUndo, seek, setPlaybackMode, setVolume, stop]);
 
   const acknowledgePlayerAction = useCallback(
     async (
@@ -600,13 +629,16 @@ export function AgentProvider({
           const payload = msg.data as Record<string, unknown>;
           if (
             payload.type === "tool_result" &&
-            payload.name === "convert_video" &&
             typeof payload.content === "string"
           ) {
             try {
               const result = JSON.parse(payload.content) as Record<string, unknown>;
-              if (result.job && typeof result.job === "object") {
+              if (["convert_video", "create_smart_playlist", "manage_playlist_draft"].includes(String(payload.name)) && result.job && typeof result.job === "object") {
                 registerJob(result.job as DownloadJob);
+              }
+              if (["create_music_playlist", "add_track_to_music_playlist", "manage_music_playlist", "create_smart_playlist", "manage_playlist_draft"].includes(String(payload.name)) &&
+                  ((result.playlist && typeof result.playlist === "object") || result.status === "deleted")) {
+                void refreshPlaylists();
               }
             } catch {
               // The visible tool message still exposes malformed results for diagnosis.
@@ -654,6 +686,7 @@ export function AgentProvider({
             if (data.history && Array.isArray(data.history)) {
             const clearOffset = data.clear_offset ?? 0;
             const filtered = data.history.slice(clearOffset);
+            const seenDraftIds = new Set<string>();
             const historyMessages: ChatMessage[] = filtered.map((record: Record<string, unknown>) => {
               const metadata =
                 record.metadata && typeof record.metadata === "object"
@@ -662,12 +695,17 @@ export function AgentProvider({
               const cards = Array.isArray(metadata.track_cards)
                 ? (metadata.track_cards as TrackCardData[])
                 : undefined;
+              const draftIds = Array.isArray(metadata.playlist_draft_ids) ? metadata.playlist_draft_ids.filter((id: unknown): id is string => {
+                if (typeof id !== "string" || seenDraftIds.has(id)) return false;
+                seenDraftIds.add(id); return true;
+              }) : [];
               return {
                 id: newId(),
                 role: (record.role === "agent" ? "agent" : "operator") as "agent" | "operator",
                 content: record.content as string,
                 timestamp: new Date(record.timestamp as string).getTime() || Date.now(),
                 ...(cards?.length ? { trackCards: cards } : {}),
+                ...(draftIds.length ? { playlistDraftIds: draftIds } : {}),
               };
             });
             setMessages(historyMessages);
