@@ -99,6 +99,14 @@ def init_download_job_db() -> None:
                     ON download_job_items(job_id, position);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(download_jobs)")}
+            if "target_playlist_id" not in columns:
+                conn.execute("ALTER TABLE download_jobs ADD COLUMN target_playlist_id TEXT")
+            if "idempotency_key" not in columns:
+                conn.execute("ALTER TABLE download_jobs ADD COLUMN idempotency_key TEXT")
+            if "playlist_order_json" not in columns:
+                conn.execute("ALTER TABLE download_jobs ADD COLUMN playlist_order_json TEXT NOT NULL DEFAULT '{}'")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_download_job_idempotency ON download_jobs(user_id, idempotency_key)")
         _initialized_path = resolved
 
 
@@ -134,6 +142,8 @@ def _job_from_conn(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | No
         "id": row["id"],
         "user_id": row["user_id"],
         "status": row["status"],
+        "target_playlist_id": row["target_playlist_id"],
+        "playlist_order": _json_object(row["playlist_order_json"]),
         "total_items": row["total_items"],
         "completed_items": row["completed_items"],
         "failed_items": row["failed_items"],
@@ -205,8 +215,8 @@ def list_download_jobs(
 
 
 def _normalize_items(items: list[dict[str, Any]]) -> list[dict[str, str]]:
-    if not 1 <= len(items) <= 20:
-        raise ValueError("download items must contain between 1 and 20 entries")
+    if not 1 <= len(items) <= 50:
+        raise ValueError("download items must contain between 1 and 50 entries")
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw in items:
@@ -243,19 +253,27 @@ def create_download_job(
     user_id: str,
     items: list[dict[str, Any]],
     schedule: bool = True,
+    target_playlist_id: str | None = None,
+    idempotency_key: str | None = None,
+    playlist_order: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized = _normalize_items(items)
     job_id = str(uuid4())
     owner = user_id.strip() or DEFAULT_USER_ID
     now = _now()
     with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if idempotency_key:
+            existing = conn.execute("SELECT id FROM download_jobs WHERE user_id = ? AND idempotency_key = ?", (owner, idempotency_key)).fetchone()
+            if existing:
+                return _job_from_conn(conn, existing["id"])
         conn.execute(
             """
             INSERT INTO download_jobs (
-                id, user_id, status, total_items, created_at, updated_at
-            ) VALUES (?, ?, 'queued', ?, ?, ?)
+                id, user_id, status, total_items, created_at, updated_at, target_playlist_id, idempotency_key, playlist_order_json
+            ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)
             """,
-            (job_id, owner, len(normalized), now, now),
+            (job_id, owner, len(normalized), now, now, target_playlist_id, idempotency_key, json.dumps(playlist_order or {}, ensure_ascii=False)),
         )
         for position, item in enumerate(normalized):
             conn.execute(
@@ -285,6 +303,36 @@ def create_download_job(
         _worker_wakeup.set()
     assert job is not None
     return job
+
+
+def _place_downloaded_items(job: dict, downloaded_bvids: set[str]) -> None:
+    """Place only this job's remote items; preserve existing items' relative order."""
+    from services.music_library_store import get_playlist, reorder_playlist_items
+    playlist = get_playlist(job["target_playlist_id"], job["user_id"])
+    if playlist is None:
+        raise LookupError("target playlist deleted")
+    plan = job["playlist_order"]
+    def identity(item):
+        track = item["track"]
+        return f"bvid:{track['bvid']}" if track.get("bvid") else f"id:{track['id']}"
+    by_key = {identity(item): item for item in playlist["items"]}
+    moving = {item["id"] for item in playlist["items"] if item["track"].get("bvid") in downloaded_bvids}
+    ordered = [item["id"] for item in playlist["items"] if item["id"] not in moving]
+    anchor = plan.get("anchor") or ""
+    for key in plan.get("items", []):
+        item = by_key.get(key)
+        if not item:
+            continue
+        if item["id"] in moving:
+            if anchor in ordered:
+                index = ordered.index(anchor) + 1
+            else:
+                following = next((by_key[k]["id"] for k in plan["items"] if k in by_key and by_key[k]["id"] in ordered), None)
+                index = ordered.index(following) if following else len(ordered)
+            ordered.insert(index, item["id"])
+        anchor = item["id"]
+    if ordered != [item["id"] for item in playlist["items"]]:
+        reorder_playlist_items(playlist["id"], ordered, expected_revision=playlist["revision"], user_id=job["user_id"])
 
 
 def _refresh_job_progress(conn: sqlite3.Connection, job_id: str) -> None:
@@ -442,13 +490,39 @@ def run_download_job(job_id: str) -> dict[str, Any] | None:
             local_tracks.append(serialized_track)
             tracks_by_bvid[bvid] = serialized_track
 
+    # Only canonical local Tracks enter a durable playlist. This is idempotent
+    # across worker recovery; deleted playlists are never recreated here.
+    if job.get("target_playlist_id"):
+        from services.music_library_store import add_playlist_track
+        for bvid in files_by_bvid:
+            try:
+                canonical = tracks_by_bvid.get(bvid)
+                if not canonical:
+                    raise ValueError("下载完成但未找到本地 Track")
+                add_playlist_track(job["target_playlist_id"], track=canonical,
+                                   expected_revision=None, user_id=job["user_id"])
+            except Exception as exc:
+                error = {"bvid": bvid, "code": "playlist_add_failed",
+                         "message": f"音频已下载，但加入歌单失败：{str(exc)[:300]}", "retryable": True}
+                errors_by_bvid[bvid] = error
+                result.setdefault("errors", []).append(error)
+
+        if job.get("playlist_order") and files_by_bvid:
+            try:
+                _place_downloaded_items(job, set(files_by_bvid))
+            except (LookupError, ValueError, RuntimeError) as exc:
+                for bvid in files_by_bvid:
+                    error = {"bvid": bvid, "code": "playlist_order_failed", "message": f"音频已下载，歌单排序未完成：{str(exc)[:200]}", "retryable": True}
+                    errors_by_bvid[bvid] = error
+                    result.setdefault("errors", []).append(error)
+
     cancelled = _is_cancel_requested(job_id) or result.get("status") == "cancelled"
     with _connect() as conn:
         for item in items:
             bvid = str(item["bvid"])
             file_result = files_by_bvid.get(bvid)
             error_result = errors_by_bvid.get(bvid)
-            if file_result is not None:
+            if file_result is not None and error_result is None:
                 serialized_track = tracks_by_bvid.get(bvid)
                 conn.execute(
                     """
@@ -649,6 +723,8 @@ def retry_download_job(
         user_id=user_id,
         items=retry_items,
         schedule=schedule,
+        target_playlist_id=job.get("target_playlist_id"),
+        playlist_order=job.get("playlist_order"),
     )
 
 

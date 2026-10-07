@@ -101,3 +101,44 @@ def test_cancel_queued_job_and_retry_failed_items(monkeypatch, tmp_path):
     assert cancelled["items"][0]["status"] == "cancelled"
     assert retried["id"] != job["id"]
     assert retried["status"] == "queued"
+
+
+def test_download_success_joins_owned_playlist_and_retry_preserves_target(monkeypatch, tmp_path):
+    from models import Track
+    from services import music_library_store as library
+    _isolated_jobs(monkeypatch, tmp_path)
+    monkeypatch.setattr(library, "_DB_DIR", tmp_path)
+    monkeypatch.setattr(library, "_DB_PATH", tmp_path / "library.db")
+    playlist = library.create_playlist("歌曲", user_id="user-a")
+    track = Track(id="local.mp3", title="七里香", author="周杰伦", date="", filename="local.mp3", subDir="", size=1, url="/api/tracks/local.mp3", bvid="BV123")
+    monkeypatch.setattr("services.music_manager.find_track_by_bvid", lambda bvid: track if bvid == "BV123" else None)
+    monkeypatch.setattr("services.wiki_sync.sync_downloaded_sources", lambda sources: {"status": "completed"})
+    monkeypatch.setattr(download_job_service, "download_bilibili_audio", lambda **kwargs: {
+        "files": [{"bvid": "BV123"}], "errors": [{"bvid": "BV456", "code": "download_failed", "message": "失败"}]})
+    job = download_job_service.create_download_job(user_id="user-a", items=[_item(), _item("BV456")],
+        target_playlist_id=playlist["id"], schedule=False)
+    result = download_job_service.run_download_job(job["id"])
+    assert result["status"] == "partial"
+    assert [item["track"]["id"] for item in library.get_playlist(playlist["id"], "user-a")["items"]] == [track.id]
+    retry = download_job_service.retry_download_job(job["id"], user_id="user-a", schedule=False)
+    assert retry["target_playlist_id"] == playlist["id"]
+    assert [item["bvid"] for item in retry["items"]] == ["BV456"]
+
+
+def test_deleted_playlist_is_not_recreated_by_download_worker(monkeypatch, tmp_path):
+    from models import Track
+    from services import music_library_store as library
+    _isolated_jobs(monkeypatch, tmp_path)
+    monkeypatch.setattr(library, "_DB_DIR", tmp_path)
+    monkeypatch.setattr(library, "_DB_PATH", tmp_path / "library.db")
+    track = Track(id="local.mp3", title="Song", author="Artist", date="", filename="local.mp3", subDir="", size=1, url="/api/tracks/local.mp3", bvid="BV123")
+    monkeypatch.setattr("services.music_manager.find_track_by_bvid", lambda bvid: track)
+    monkeypatch.setattr("services.wiki_sync.sync_downloaded_sources", lambda sources: {"status": "completed"})
+    monkeypatch.setattr(download_job_service, "download_bilibili_audio", lambda **kwargs: {"files": [{"bvid": "BV123"}], "errors": []})
+    job = download_job_service.create_download_job(user_id="user-a", items=[_item()],
+        target_playlist_id="deleted-playlist", schedule=False)
+    result = download_job_service.run_download_job(job["id"])
+    assert result["status"] == "failed"
+    assert result["items"][0]["error"]["code"] == "playlist_add_failed"
+    assert library.list_playlists("user-a") == []
+    assert result["result"]["tracks"][0]["id"] == track.id

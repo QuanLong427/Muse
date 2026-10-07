@@ -47,6 +47,10 @@ def _ensure_music_library_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE playback_events ADD COLUMN scenario TEXT NOT NULL DEFAULT '默认'"
         )
+    playlist_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(named_playlists)")}
+    if "smart_batch_id" not in playlist_columns:
+        conn.execute("ALTER TABLE named_playlists ADD COLUMN smart_batch_id TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_playlist_smart_batch ON named_playlists(user_id, smart_batch_id)")
 
 
 def init_music_library_db() -> None:
@@ -89,6 +93,15 @@ def init_music_library_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_named_playlist_items_position
             ON named_playlist_items(playlist_id, position);
+
+            CREATE TABLE IF NOT EXISTS playlist_batch_applications (
+                user_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                playlist_id TEXT NOT NULL,
+                added_count INTEGER NOT NULL,
+                PRIMARY KEY (user_id, batch_id),
+                FOREIGN KEY (playlist_id) REFERENCES named_playlists(id) ON DELETE CASCADE
+            );
 
             CREATE TABLE IF NOT EXISTS playback_events (
                 id TEXT PRIMARY KEY,
@@ -270,6 +283,113 @@ def create_playlist(
         conn.close()
 
 
+def create_playlist_with_tracks(
+    name: str,
+    tracks: list[dict[str, Any]],
+    *,
+    description: str = "",
+    user_id: str = DEFAULT_USER_ID,
+    smart_batch_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a named playlist and all of its items in one transaction.
+
+    The supplied local subset is created atomically. A smart batch key permits
+    an empty playlist while remote downloads are pending and makes repeated
+    submission idempotent. Remote candidates are owned by the download job,
+    never by this table.
+    """
+    normalized_name = " ".join(name.split()).strip()
+    if not normalized_name:
+        raise ValueError("playlist name is required")
+
+    normalized_tracks: list[dict[str, Any]] = []
+    seen_track_ids: set[str] = set()
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError("playlist track must be an object")
+        track_id = str(track.get("id") or "").strip()
+        if not track_id:
+            raise ValueError("track.id is required")
+        if track_id in seen_track_ids:
+            continue
+        seen_track_ids.add(track_id)
+        normalized_tracks.append(track)
+    if not normalized_tracks and not smart_batch_id:
+        raise ValueError("playlist requires at least one track")
+
+    init_music_library_db()
+    playlist_id = str(uuid4())
+    now = _now()
+    normalized_user = user_id.strip() or DEFAULT_USER_ID
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if smart_batch_id:
+            existing = conn.execute(
+                "SELECT id FROM named_playlists WHERE user_id = ? AND smart_batch_id = ?",
+                (normalized_user, smart_batch_id),
+            ).fetchone()
+            if existing:
+                conn.rollback()
+                return _playlist_from_conn(conn, existing["id"])
+        conn.execute(
+            """
+            INSERT INTO named_playlists
+                (id, user_id, name, description, revision, created_at, updated_at, smart_batch_id)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                playlist_id,
+                normalized_user,
+                normalized_name,
+                description.strip(),
+                now,
+                now,
+                smart_batch_id,
+            ),
+        )
+        for position, track in enumerate(normalized_tracks):
+            conn.execute(
+                """
+                INSERT INTO named_playlist_items (
+                    id, playlist_id, track_id, title, author, url, filename,
+                    bvid, sub_dir, size, date, position, added_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    playlist_id,
+                    str(track["id"]),
+                    str(track.get("title") or ""),
+                    str(track.get("author") or ""),
+                    str(track.get("url") or ""),
+                    str(track.get("filename") or ""),
+                    str(track.get("bvid") or ""),
+                    str(track.get("subDir", track.get("sub_dir", "")) or ""),
+                    int(track.get("size") or 0),
+                    str(track.get("date") or ""),
+                    position,
+                    now,
+                ),
+            )
+        conn.execute(
+            "UPDATE named_playlists SET revision = 1 WHERE id = ?",
+            (playlist_id,),
+        )
+        conn.commit()
+        playlist = _playlist_from_conn(conn, playlist_id)
+        assert playlist is not None
+        return playlist
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError("playlist name already exists") from exc
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _require_owned_playlist(
     conn: sqlite3.Connection,
     playlist_id: str,
@@ -405,6 +525,76 @@ def add_playlist_track(
         playlist = _playlist_from_conn(conn, playlist_id)
         assert playlist is not None
         return playlist
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def append_playlist_batch(
+    playlist_id: str,
+    *,
+    tracks: list[dict[str, Any]],
+    batch_id: str,
+    expected_revision: int | None,
+    user_id: str = DEFAULT_USER_ID,
+) -> dict[str, Any]:
+    """Atomically append a local subset and record its idempotent batch receipt."""
+    if not batch_id or any(not str(track.get("id") or "").strip() for track in tracks):
+        raise ValueError("batch_id and canonical track identities are required")
+    init_music_library_db()
+    owner = user_id.strip() or DEFAULT_USER_ID
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_owned_playlist(conn, playlist_id, owner, None)
+        receipt = conn.execute(
+            "SELECT playlist_id, added_count FROM playlist_batch_applications WHERE user_id = ? AND batch_id = ?",
+            (owner, batch_id),
+        ).fetchone()
+        if receipt:
+            if receipt["playlist_id"] != playlist_id:
+                raise ValueError("preview already applied to another playlist")
+            conn.rollback()
+            return {**_playlist_from_conn(conn, playlist_id), "added_count": receipt["added_count"], "replayed": True}
+        _require_owned_playlist(conn, playlist_id, owner, expected_revision)
+        existing = conn.execute(
+            "SELECT track_id, bvid FROM named_playlist_items WHERE playlist_id = ?", (playlist_id,)
+        ).fetchall()
+        ids = {row["track_id"] for row in existing}
+        bvids = {row["bvid"] for row in existing if row["bvid"]}
+        position = len(existing)
+        added = 0
+        for track in tracks:
+            track_id = str(track["id"])
+            bvid = str(track.get("bvid") or "")
+            if track_id in ids or (bvid and bvid in bvids):
+                continue
+            conn.execute(
+                """INSERT INTO named_playlist_items
+                (id, playlist_id, track_id, title, author, url, filename, bvid,
+                 sub_dir, size, date, position, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(uuid4()), playlist_id, track_id, str(track.get("title") or ""),
+                 str(track.get("author") or ""), str(track.get("url") or ""),
+                 str(track.get("filename") or ""), bvid,
+                 str(track.get("subDir", track.get("sub_dir", "")) or ""),
+                 int(track.get("size") or 0), str(track.get("date") or ""), position, _now()),
+            )
+            ids.add(track_id)
+            if bvid:
+                bvids.add(bvid)
+            position += 1
+            added += 1
+        if added:
+            _touch_playlist(conn, playlist_id)
+        conn.execute(
+            "INSERT INTO playlist_batch_applications VALUES (?, ?, ?, ?)",
+            (owner, batch_id, playlist_id, added),
+        )
+        conn.commit()
+        return {**_playlist_from_conn(conn, playlist_id), "added_count": added, "replayed": False}
     except Exception:
         conn.rollback()
         raise

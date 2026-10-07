@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
-from routers import bili, chat, config, downloads, dream, history, memory, music_library, playback, playlist, scenario, search, tracks, voice, wiki
+from routers import bili, chat, config, downloads, dream, history, memory, music_library, playback, playlist, playlist_drafts, scenario, search, tracks, voice, wiki
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,7 @@ app.include_router(memory.router)
 app.include_router(music_library.router)
 app.include_router(playback.router)
 app.include_router(playlist.router)
+app.include_router(playlist_drafts.router)
 app.include_router(scenario.router)
 app.include_router(search.router)
 app.include_router(tracks.router)

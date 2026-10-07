@@ -87,6 +87,30 @@ class TrackFeedbackRequest(BaseModel):
     source: str = Field(default="user", max_length=40)
 
 
+class SmartPlaylistPreviewRequest(BaseModel):
+    target_playlist_id: str = Field(default="", max_length=128)
+    user_id: str = DEFAULT_USER_ID
+    scenario: str = Field(default="默认", max_length=80)
+    count: int | None = Field(default=None, ge=1, le=50)
+    duration_minutes: float | None = Field(default=None, ge=1, le=720)
+    query: str = Field(default="", max_length=500)
+    include_artists: list[str] = Field(default_factory=list, max_length=30)
+    exclude_artists: list[str] = Field(default_factory=list, max_length=30)
+    genre: str = Field(default="", max_length=80)
+    mood: str = Field(default="", max_length=80)
+    language: str = Field(default="", max_length=40)
+    exclude_versions: list[str] = Field(default_factory=list, max_length=10)
+    energy_curve: str = Field(default="", max_length=40)
+    source_policy: Literal["balanced", "local", "cloud"] = "balanced"
+
+
+class SaveSmartPlaylistRequest(BaseModel):
+    target_playlist_id: str = Field(default="", max_length=128)
+    user_id: str = DEFAULT_USER_ID
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
 def _translate_error(exc: Exception):
     if isinstance(exc, PlaylistRevisionConflictError):
         raise HTTPException(
@@ -239,6 +263,32 @@ async def recommend_radio(req: RadioRecommendationRequest):
         scenario=req.scenario,
         current_track_id=req.current_track_id,
     )
+
+
+@router.post("/api/smart-playlists/preview")
+def preview_smart_playlist(req: SmartPlaylistPreviewRequest):
+    from services.smart_playlist_service import generate_smart_playlist
+
+    try:
+        return generate_smart_playlist(**req.model_dump(mode="python"))
+    except Exception as exc:
+        _translate_error(exc)
+
+
+@router.post("/api/smart-playlists/{batch_id}/save", status_code=201)
+def save_smart_playlist(batch_id: str, req: SaveSmartPlaylistRequest):
+    from services.smart_playlist_service import save_smart_playlist_preview
+
+    try:
+        return save_smart_playlist_preview(
+            batch_id=batch_id,
+            name=req.name,
+            description=req.description,
+            user_id=req.user_id,
+            target_playlist_id=req.target_playlist_id,
+        )
+    except Exception as exc:
+        _translate_error(exc)
 
 
 @router.get("/api/recommendations/{batch_id}")

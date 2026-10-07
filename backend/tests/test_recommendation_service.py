@@ -60,6 +60,32 @@ def _video(index: int, artist: str = "Cloud Artist") -> dict:
     }
 
 
+def test_unknown_seeds_and_non_music_candidates_are_rejected():
+    queries = service._cloud_queries(artist="", genre="", wiki={"songs": []},
+        recent_profile={"artists": [{"author": "Unknown"}, {"author": "周杰伦"}]},
+        memory_seeds={"songs": [], "artists": ["未知歌手"], "genres": []},
+        seed_songs=[], catalog_artists=["N/A", "Coldplay"], limit=5)
+    assert queries == ["周杰伦", "Coldplay"]
+    for title in ["ASMR 轻语", "（unknown）小姐姐的快感敲击音", "妹妹的抓挠音", "助眠白噪音"]:
+        assert not service._usable_cloud_video({"bvid": "BVtest", "title": title, "duration": "4:00"})
+    assert service._usable_cloud_video({"bvid": "BVtest", "title": "初音未来 unknown 官方MV", "duration": "4:00"})
+    scores, _ = service._positive_score_map([{"author": "Unknown", "score": 999}, {"author": "Coldplay", "score": 2}], "author")
+    assert scores == {"Coldplay": 2}
+
+
+def test_cloud_sources_do_not_stop_at_first_full_keyword(monkeypatch):
+    _prepare_conversation_dependencies(monkeypatch, [])
+    calls = []
+    def search(query):
+        calls.append(query)
+        start = 1 if query == "周杰伦 七里香" else 10
+        return {"status": "ok", "videos": [{**_video(start + i, "周杰伦"), "title": f"周杰伦《曲{start+i}》MV"} for i in range(4)]}
+    result = service.recommend_conversational_tracks(user_id="u", count=4, source_policy="cloud", artist="周杰伦", seed_songs=["七里香", "稻香"], cloud_search=search)
+    assert calls[:2] == ["周杰伦 七里香", "周杰伦 稻香"]
+    assert result["videos"][0]["bvid"] == _video(1)["bvid"]
+    assert result["videos"][1]["bvid"] == _video(10)["bvid"]
+
+
 def test_radio_candidates_are_local_and_exclude_session_and_recent(monkeypatch):
     monkeypatch.setattr(
         service,
@@ -290,6 +316,21 @@ def test_song_identity_prefers_song_quotes_over_quality_badges():
     assert service._song_identity_from_title(
         "【4K60FPS】周杰伦《七里香》封神之作"
     ) == service._fold("七里香")
+
+
+def test_memory_preference_seeds_do_not_turn_avoidance_into_positive_seed(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "list_memory_items",
+        lambda *args, **kwargs: [
+            {"kind": "avoidance", "memory_key": "artist:Blocked"},
+            {"kind": "preference", "memory_key": "artist:Preferred"},
+        ],
+    )
+
+    seeds = service._memory_preference_seeds("local", "默认")
+
+    assert seeds["artists"] == ["Preferred"]
     assert service._song_identity_from_title(
         "【Hi-Res无损】｜《七里香》- 周杰伦"
     ) == service._fold("七里香")

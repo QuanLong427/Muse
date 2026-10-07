@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 
 from models import Track
+from services.music_metadata import normalize_artist, is_non_music_source
 from services.music_library_store import (
     list_feedback_excluded_track_ids,
     list_recent_tracks,
@@ -105,7 +106,7 @@ def _song_identity_from_title(
 def _usable_cloud_video(video: dict[str, Any], artist: str = "") -> bool:
     title = str(video.get("title") or "").strip()
     bvid = str(video.get("bvid") or "").strip()
-    if not title or not bvid or any(marker in title for marker in _COMPILATION_MARKERS):
+    if not title or not bvid or is_non_music_source(title) or any(marker in title for marker in _COMPILATION_MARKERS):
         return False
     folded_title = title.casefold()
     if any(marker in folded_title for marker in _UNREQUESTED_VERSION_MARKERS):
@@ -126,6 +127,8 @@ def _memory_preference_seeds(user_id: str, scenario: str) -> dict[str, list[str]
         include_global=True,
         limit=30,
     ):
+        if str(item.get("kind") or "") not in {"preference", "music_fact"}:
+            continue
         key = str(item.get("memory_key") or "").strip()
         prefix, separator, value = key.partition(":")
         if not separator or not value.strip():
@@ -137,8 +140,9 @@ def _memory_preference_seeds(user_id: str, scenario: str) -> dict[str, list[str]
             "song": "songs",
             "track": "songs",
         }.get(prefix.casefold())
-        if target and value.strip() not in seeds[target]:
-            seeds[target].append(value.strip())
+        value = normalize_artist(value) if target == "artists" else value.strip()
+        if target and value and value not in seeds[target]:
+            seeds[target].append(value)
     return seeds
 
 
@@ -227,6 +231,7 @@ def _cloud_queries(
     catalog_artists: list[str],
     limit: int,
 ) -> list[str]:
+    artist = normalize_artist(artist)
     queries: list[str] = []
     wiki_songs = [str(value) for value in wiki.get("songs", []) if value]
     if artist:
@@ -240,14 +245,14 @@ def _cloud_queries(
     else:
         queries.extend(seed_songs[:limit])
         queries.extend(memory_seeds["songs"][:limit])
-        queries.extend(memory_seeds["artists"][:limit])
+        queries.extend(a for value in memory_seeds["artists"] if (a := normalize_artist(value)))
         queries.extend(
-            str(item.get("author") or "")
+            normalize_artist(item.get("author"))
             for item in recent_profile.get("artists", [])[:limit]
             if str(item.get("author") or "").strip()
         )
         queries.extend(wiki_songs[:limit])
-        queries.extend(catalog_artists[:limit])
+        queries.extend(a for value in catalog_artists if (a := normalize_artist(value)))
     normalized: list[str] = []
     seen: set[str] = set()
     for query in queries:
@@ -257,6 +262,23 @@ def _cloud_queries(
             normalized.append(query)
             seen.add(key)
     return normalized[: max(2, min(limit * 2, 8))]
+
+
+def _select_cloud_diversity(items: list[dict], limit: int) -> list[dict]:
+    """Round-robin relevant search sources, then fill remaining slots.
+
+    Popularity only orders candidates within a source. One keyword cannot
+    consume all slots before the other bounded searches have been inspected.
+    """
+    groups: dict[str, list[dict]] = {}
+    for item in items:
+        groups.setdefault(item.pop("search_query", ""), []).append(item)
+    selected = []
+    while len(selected) < limit and any(groups.values()):
+        for candidates in groups.values():
+            if candidates and len(selected) < limit:
+                selected.append(candidates.pop(0))
+    return selected
 
 
 def recommend_conversational_tracks(
@@ -279,7 +301,7 @@ def recommend_conversational_tracks(
     requested_count = max(1, min(int(count), 12))
     if source_policy not in {"balanced", "local", "cloud"}:
         raise ValueError("unsupported source_policy")
-    artist = artist.strip()
+    artist = normalize_artist(artist)
     genre = genre.strip()
     normalized_seed_songs: list[str] = []
     seen_seed_songs: set[str] = set()
@@ -309,7 +331,7 @@ def recommend_conversational_tracks(
         *memory_seeds["genres"],
     ]
     seed_terms.extend(
-        str(item.get("author") or "")
+        normalize_artist(item.get("author"))
         for item in recent_profile.get("artists", [])[:5]
     )
     wiki = _wiki_recommendation_context(list(dict.fromkeys(filter(None, seed_terms))))
@@ -417,8 +439,8 @@ def recommend_conversational_tracks(
                     "attempts": 0,
                 }
             )
-        for cloud_query in queries:
-            if len(cloud_items) >= cloud_goal:
+        for cloud_query in queries[:4]:
+            if cloud_search is None:
                 break
             try:
                 result = cloud_search(cloud_query)
@@ -442,7 +464,7 @@ def recommend_conversational_tracks(
                     }
                 )
                 continue
-            videos = [item for item in result.get("videos", []) if isinstance(item, dict)]
+            videos = [item for item in result.get("videos", []) if isinstance(item, dict)][:30]
             videos.sort(key=lambda item: -int(item.get("play") or 0))
             for video in videos:
                 bvid = str(video.get("bvid") or "").strip()
@@ -478,10 +500,14 @@ def recommend_conversational_tracks(
                         "reasons": [
                             {"code": "cloud_discovery", "detail": f"通过检索条件“{cloud_query}”找到的在线候选"}
                         ],
+                        "search_query": cloud_query,
                     }
                 )
-                if len(cloud_items) >= cloud_goal:
-                    break
+
+    cloud_items = _select_cloud_diversity(cloud_items, cloud_goal)
+    selected_bvids = [item["track"]["bvid"] for item in cloud_items]
+    video_index = {video["bvid"]: video for video in selected_videos}
+    selected_videos = [video_index[bvid] for bvid in selected_bvids]
 
     if len(cloud_items) < cloud_goal:
         needed = requested_count - len(cloud_items) - len(local_selected)
@@ -585,6 +611,8 @@ def _positive_score_map(items: Any, key: str) -> tuple[dict[str, float], float]:
                 continue
             identity = str(item.get(key) or "").strip()
             score = float(item.get("score") or 0.0)
+            if key == "author":
+                identity = normalize_artist(identity)
             if identity and score > 0:
                 values[identity] = score
     return values, max(values.values(), default=1.0)
@@ -615,8 +643,9 @@ def _rank_candidate(
                 "evidence_score": round(recent_track_score, 6),
             }
         )
-    recent_artist_score = artist_scores.get(track.author, 0.0)
-    if track.author and recent_artist_score > 0:
+    normalized_artist = normalize_artist(track.author)
+    recent_artist_score = artist_scores.get(normalized_artist, 0.0)
+    if normalized_artist and recent_artist_score > 0:
         score += 0.45 * recent_artist_score / max_artist_score
         reasons.append(
             {
@@ -625,7 +654,7 @@ def _rank_candidate(
                 "evidence_score": round(recent_artist_score, 6),
             }
         )
-    if current_author and track.author == current_author:
+    if normalize_artist(current_author) and normalized_artist == normalize_artist(current_author):
         score += 0.15
         reasons.append(
             {
@@ -651,7 +680,7 @@ def _select_with_artist_diversity(
     deferred: list[dict[str, Any]] = []
     author_counts: dict[str, int] = {}
     for item in ranked:
-        author = str(item["track"].get("author") or "")
+        author = normalize_artist(item["track"].get("author"))
         if author and author_counts.get(author, 0) >= 2:
             deferred.append(item)
             continue

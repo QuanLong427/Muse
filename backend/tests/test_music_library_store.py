@@ -22,6 +22,33 @@ def _track(track_id: str = "library/song.mp3") -> dict:
     }
 
 
+def test_append_batch_is_atomic_owned_and_idempotent(monkeypatch, tmp_path):
+    _use_isolated_db(monkeypatch, tmp_path)
+    playlist = store.create_playlist("Original")
+    tracks = [{**_track("a"), "bvid": "BV-a"}, {**_track("b"), "bvid": "BV-b"}]
+    result = store.append_playlist_batch(playlist["id"], tracks=tracks, batch_id="batch", expected_revision=0)
+    assert result["added_count"] == 2
+    assert result["revision"] == 1
+    repeated = store.append_playlist_batch(playlist["id"], tracks=tracks, batch_id="batch", expected_revision=0)
+    assert repeated["replayed"] is True
+    assert repeated["revision"] == 1
+    assert len(store.list_playlists()) == 1
+    with pytest.raises(LookupError):
+        store.append_playlist_batch(playlist["id"], tracks=tracks, batch_id="other", expected_revision=None, user_id="other-user")
+    with pytest.raises(store.PlaylistRevisionConflictError):
+        store.append_playlist_batch(playlist["id"], tracks=tracks, batch_id="other", expected_revision=0)
+
+
+def test_append_batch_rolls_back_all_items_on_invalid_track(monkeypatch, tmp_path):
+    _use_isolated_db(monkeypatch, tmp_path)
+    playlist = store.create_playlist("Original")
+    with pytest.raises(ValueError):
+        store.append_playlist_batch(playlist["id"], tracks=[_track("a"), {**_track("b"), "bvid": "new", "size": "invalid"}],
+                                    batch_id="batch", expected_revision=0)
+    assert store.get_playlist(playlist["id"])["items"] == []
+    assert store.get_playlist(playlist["id"])["revision"] == 0
+
+
 def test_named_playlist_lifecycle_is_separate_from_playback(monkeypatch, tmp_path):
     _use_isolated_db(monkeypatch, tmp_path)
     playlist = store.create_playlist("Night Run")
