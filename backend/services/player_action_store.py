@@ -16,6 +16,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from config import PROJECT_ROOT
+from services.sqlite_runtime import connect_database
 
 
 _DB_DIR = PROJECT_ROOT / "memory" / "data"
@@ -29,9 +30,7 @@ def _now() -> str:
 
 def _get_conn() -> sqlite3.Connection:
     _DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH), timeout=5)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(_DB_PATH, timeout=5)
 
 
 def init_player_action_db() -> None:

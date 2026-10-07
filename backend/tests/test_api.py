@@ -10,11 +10,26 @@ from config import settings
 client = TestClient(app)
 
 
-def test_health_endpoint():
+def test_health_endpoint(monkeypatch, tmp_path):
     """Test health check endpoint."""
+    from services import memory_store
+    monkeypatch.setattr(memory_store, "MEMORY_DATA_DIR", tmp_path)
+    monkeypatch.setattr(memory_store, "MEMORY_DB_PATH", tmp_path / "memory.db")
+    memory_store.init_memory_db()
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
+    assert response.json()["memory"]["status"] == "ok"
+
+
+def test_health_detects_memory_io_failure(monkeypatch):
+    from services import memory_store
+    def unavailable():
+        raise OSError("disk I/O error")
+    monkeypatch.setattr(memory_store, "check_memory_health", unavailable)
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Memory storage unavailable"
 
 
 def test_search_missing_query():

@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from config import PROJECT_ROOT, settings
 from services.bili_downloader import download_bilibili_audio, extract_bvid
+from services.sqlite_runtime import connect_database
 
 
 DEFAULT_USER_ID = "local"
@@ -38,10 +39,7 @@ def _now() -> str:
 
 def _connect() -> sqlite3.Connection:
     init_download_job_db()
-    conn = sqlite3.connect(str(_DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return connect_database(_DB_PATH)
 
 
 def init_download_job_db() -> None:
@@ -53,8 +51,7 @@ def init_download_job_db() -> None:
         if _initialized_path == resolved and _DB_PATH.exists():
             return
         _DB_DIR.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(_DB_PATH), timeout=30) as conn:
-            conn.execute("PRAGMA journal_mode = WAL")
+        with connect_database(_DB_PATH) as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS download_jobs (

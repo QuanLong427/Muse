@@ -15,6 +15,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from config import PROJECT_ROOT
+from services.sqlite_runtime import connect_database
 
 
 _DB_DIR = PROJECT_ROOT / "memory" / "data"
@@ -33,10 +34,7 @@ class RevisionConflictError(RuntimeError):
 
 def _get_conn() -> sqlite3.Connection:
     _DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return connect_database(_DB_PATH)
 
 
 def _now() -> str:

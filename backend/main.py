@@ -10,7 +10,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
@@ -112,7 +112,13 @@ app.include_router(wiki.router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    from services.memory_store import check_memory_health
+    try:
+        memory_health = await asyncio.to_thread(check_memory_health)
+    except Exception:
+        logger.exception("[health] Memory storage unavailable")
+        raise HTTPException(status_code=503, detail="Memory storage unavailable")
+    return {"status": "ok", "memory": memory_health}
 
 
 if __name__ == "__main__":

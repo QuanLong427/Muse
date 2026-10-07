@@ -9,7 +9,7 @@ The store intentionally separates three concerns:
 
 All public functions open their own connection.  This keeps FastAPI requests and
 the background Dream worker from sharing sqlite connection objects across
-threads while WAL mode and transactions serialize writes safely.
+threads while rollback journals and transactions serialize writes safely.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from config import PROJECT_ROOT
+from services.sqlite_runtime import connect_database
 
 
 MEMORY_DATA_DIR = PROJECT_ROOT / "memory" / "data"
@@ -46,12 +47,16 @@ def _json(value: Any) -> str:
 
 def _connect() -> sqlite3.Connection:
     MEMORY_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(MEMORY_DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+    return connect_database(MEMORY_DB_PATH)
+
+
+def check_memory_health() -> dict:
+    connection = _connect()
+    try:
+        connection.execute("SELECT id FROM memory_messages LIMIT 1").fetchone()
+        return {"status": "ok", "journal_mode": connection.execute("PRAGMA journal_mode").fetchone()[0]}
+    finally:
+        connection.close()
 
 
 def init_memory_db() -> None:

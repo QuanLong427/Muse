@@ -61,6 +61,7 @@ class Settings:
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("BACKEND_PORT", "8000"))
     DREAM_INTERVAL_HOURS: int = int(os.getenv("DREAM_INTERVAL_HOURS", "24"))
+    SQLITE_JOURNAL_MODE: str = os.getenv("SQLITE_JOURNAL_MODE", "DELETE")
 
     # Keys that can be updated at runtime and persisted to .env.local
     _ENV_LOCAL_KEYS = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "MODEL_NAME"}
