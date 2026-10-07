@@ -55,6 +55,8 @@ class Settings:
     MUSIC_DIR: str = _resolve_music_dir()
     WIKI_DIR: str = _resolve_wiki_dir()
     BILIBILI_COOKIES_FILE: str = _resolve_optional_path("BILIBILI_COOKIES_FILE")
+    BILIBILI_NETWORK_MODE: str = os.getenv("BILIBILI_NETWORK_MODE", "auto").strip().lower()
+    BILIBILI_PROXY_URL: str = os.getenv("BILIBILI_PROXY_URL", "").strip()
     BILIBILI_DOWNLOAD_TIMEOUT_SECONDS: int = max(
         60, min(int(os.getenv("BILIBILI_DOWNLOAD_TIMEOUT_SECONDS", "300")), 900)
     )

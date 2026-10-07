@@ -12,9 +12,12 @@ async def bili_search(
     page: int = Query(1, ge=1),
 ):
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            result = await bili_client.search_videos(client, keyword, page)
+        result = await bili_client.search_with_network_policy(keyword, page)
+        if result.get("status") == "error":
+            raise HTTPException(status_code=502, detail=result["error"])
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 

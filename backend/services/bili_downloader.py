@@ -19,6 +19,8 @@ from queue import Empty, Queue
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from services.bili_network import network_routes, redact_proxy
+
 
 _BVID_PATTERN = re.compile(r"/video/(BV[0-9A-Za-z]{3,20})(?:[/?.]|$)")
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -76,12 +78,15 @@ def _download_command(
     bvid: str,
     work_dir: Path,
     cookie_file: Path | None,
+    proxy_url: str = "",
 ) -> list[str]:
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
         "--ignore-config",
+        "--proxy",
+        proxy_url,
         "--no-playlist",
         "--newline",
         "--extract-audio",
@@ -125,7 +130,7 @@ def _run_download_command(
     cancel_requested: CancelCheck | None,
 ) -> subprocess.CompletedProcess[str]:
     """Run yt-dlp synchronously or with observable progress and cancellation."""
-    bounded_timeout = max(60, min(int(timeout_seconds), 900))
+    bounded_timeout = max(1, min(int(timeout_seconds), 900))
     if progress_callback is None and cancel_requested is None:
         return subprocess.run(
             command,
@@ -217,7 +222,8 @@ def _download_error(stderr: str, *, cookies_configured: bool) -> dict[str, Any]:
             "code": "bilibili_request_blocked",
             "message": (
                 "B站拒绝了当前网络出口的下载请求（412 request was banned），"
-                "这不表示视频本身不可访问。若正在使用 VPN，请关闭 VPN 或让 B 站域名直连。"
+                "这不表示视频本身不可访问。已尝试配置的网络路径；若 VPN 使用全局/TUN 模式，"
+                "请为 bilibili.com、bilivideo.com 及其子域名配置直连，或切换可访问 B 站的代理出口。"
                 f"{cookie_hint}"
             ),
             "retryable": False,
@@ -244,8 +250,16 @@ def download_bilibili_audio(
     timeout_seconds: int = 300,
     progress_callback: ProgressCallback | None = None,
     cancel_requested: CancelCheck | None = None,
+    network_mode: str | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     """Download Bilibili URLs sequentially and return stable local metadata."""
+    try:
+        routes = network_routes(network_mode, proxy_url)
+    except ValueError as exc:
+        return {"success": False, "status": "failed", "files": [], "errors": [
+            {"code": "network_configuration_invalid", "message": str(exc), "retryable": False}
+        ]}
     root = Path(music_dir)
     if not root.is_dir():
         return {
@@ -341,22 +355,32 @@ def download_bilibili_audio(
                 )
             with tempfile.TemporaryDirectory(prefix=".musicer-download-", dir=target_dir) as raw_work_dir:
                 work_dir = Path(raw_work_dir)
-                result = _run_download_command(
-                    _download_command(
-                        url=url,
-                        bvid=bvid,
-                        work_dir=work_dir,
-                        cookie_file=cookies,
-                    ),
-                    timeout_seconds=timeout_seconds,
-                    bvid=bvid,
-                    progress_callback=progress_callback,
-                    cancel_requested=cancel_requested,
-                )
+                attempted_routes: list[str] = []
+                deadline = time.monotonic() + max(60, min(timeout_seconds, 900))
+                for index, (route, proxy) in enumerate(routes):
+                    attempted_routes.append(route)
+                    command = _download_command(url=url, bvid=bvid, work_dir=work_dir,
+                                                cookie_file=cookies, proxy_url=proxy)
+                    try:
+                        result = _run_download_command(
+                            command,
+                            timeout_seconds=max(1, int((deadline - time.monotonic()) / (len(routes) - index))),
+                            bvid=bvid, progress_callback=progress_callback,
+                            cancel_requested=cancel_requested,
+                        )
+                    except subprocess.TimeoutExpired:
+                        if index == len(routes) - 1:
+                            raise
+                        result = subprocess.CompletedProcess(command, 1, "", "network route timed out")
+                    if result.returncode == 0:
+                        break
+                    failure = _download_error(result.stderr or result.stdout or "", cookies_configured=bool(cookies))
+                    if failure["code"] == "bilibili_login_required" or time.monotonic() >= deadline:
+                        break
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or "yt-dlp exited with an error").strip()
                     error = _download_error(detail, cookies_configured=bool(cookies))
-                    error.update({"bvid": bvid, "url": url, "detail": detail[-2000:]})
+                    error.update({"bvid": bvid, "url": url, "detail": redact_proxy(detail[-2000:]), "network_attempts": attempted_routes})
                     errors.append(error)
                     if progress_callback:
                         progress_callback(
@@ -407,6 +431,8 @@ def download_bilibili_audio(
                         existing=already_created,
                     )
                 )
+                files[-1]["network_route"] = route
+                files[-1]["network_attempts"] = attempted_routes
                 if progress_callback:
                     progress_callback(
                         {"bvid": bvid, "status": "downloaded", "progress": 100.0}

@@ -17,7 +17,7 @@ description: 将 B站视频转为 MP3 音频文件，支持批量转换和自动
 5. **必须等待 `convert_video` 工具返回结果后，才能执行后续步骤或输出结束语**
 6. **禁止在调用 convert_video 之前或期间输出"转换已启动"、"请稍候"等结束语**
 7. **必须传入 `song_meta_json` 参数，格式见下方，artist 和 title 必须从视频标题中解析出纯净的歌手名和歌名**
-8. 如果工具返回 `bilibili_request_blocked`，本轮禁止重试。应明确说明这是当前网络出口被 B 站风控；建议关闭 VPN、为 B 站域名配置直连，或配置有效浏览器 Cookie，等待用户处理后再试
+8. 下载器按 `BILIBILI_NETWORK_MODE` 选择直连/代理；`auto` 最多尝试两条不同路径。若仍返回 `bilibili_request_blocked`，本轮禁止重复同一路径。说明已配置出口被拒绝；可为 B 站域名设置 VPN 分流直连、切换代理出口或更新 Cookie，不必要求关闭整个 VPN。
 
 **Fallback 规则（工具内部自动处理）：**
 - `artist` 缺失 → 自动使用 `"Unknown"`
@@ -64,7 +64,7 @@ convert_video(
 
 `convert_video` 内部会完成下载、转换、曲库扫描、规范 Track 构造和最小 Wiki 来源身份同步，并在 `tracks` 字段返回真实本地 Track。不要再调用 Bash、curl 或手工扫描目录，也不要自行拼接 URL。
 
-Wiki 来源身份同步只登记 BVID、文件路径、哈希和原始来源；它不执行 LLM 知识富化。歌手、专辑、版本等语义实体仍需按 `llm-wiki` Skill 的证据流程处理。
+下载成功后登记 Wiki 来源身份，并提交持久化的后台知识构建任务。下载状态与 `wiki_sync.jobs[].enrichment_status` 分开报告：`queued/running` 表示待构建/构建中，`completed` 表示已同步，`needs_review` 表示证据不足，`failed` 可单独重试。后台复用 `llm-wiki` 的证据校验服务；不要重复调用 ingest，不将模型猜测当成事实。
 
 ### 3. 结果处理
 

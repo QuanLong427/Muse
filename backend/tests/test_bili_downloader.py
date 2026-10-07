@@ -44,6 +44,7 @@ def test_classifies_412_as_non_retryable_and_does_not_repeat(tmp_path, monkeypat
         urls=["https://www.bilibili.com/video/BV123"],
         metadata=[],
         music_dir=str(tmp_path),
+        network_mode="direct",
     )
 
     assert len(commands) == 1
@@ -109,3 +110,34 @@ def test_existing_bvid_file_is_idempotent(tmp_path, monkeypatch):
     assert result["status"] == "success"
     assert result["files"][0]["existing"] is True
     assert result["files"][0]["local_file_path"] == str(existing.resolve())
+
+
+def test_auto_download_switches_from_blocked_direct_to_proxy(tmp_path, monkeypatch):
+    commands = []
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        proxy = command[command.index("--proxy") + 1]
+        if not proxy:
+            return subprocess.CompletedProcess(command, 1, "", "HTTP Error 412")
+        output = Path(command[command.index("--output") + 1])
+        Path(str(output).replace("%(ext)s", "mp3")).write_bytes(b"audio")
+        return subprocess.CompletedProcess(command, 0, "", "")
+    monkeypatch.setattr(bili_downloader.subprocess, "run", fake_run)
+    result = bili_downloader.download_bilibili_audio(urls=["https://www.bilibili.com/video/BV123"],
+        metadata=[], music_dir=str(tmp_path), network_mode="auto", proxy_url="http://proxy.test:7890")
+    assert [c[c.index("--proxy") + 1] for c in commands] == ["", "http://proxy.test:7890"]
+    assert result["status"] == "success"
+    assert result["files"][0]["network_route"] == "proxy"
+
+
+def test_direct_download_explicitly_bypasses_environment_proxy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://unreachable.test:7890")
+    commands = []
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "HTTP Error 412")
+    monkeypatch.setattr(bili_downloader.subprocess, "run", fake_run)
+    bili_downloader.download_bilibili_audio(urls=["https://www.bilibili.com/video/BV123"],
+        metadata=[], music_dir=str(tmp_path), network_mode="direct")
+    assert len(commands) == 1
+    assert commands[0][commands[0].index("--proxy") + 1] == ""

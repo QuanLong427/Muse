@@ -9,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from models import BiliVideo, DanmakuItem
+from services.bili_network import network_routes, redact_proxy
 
 MIXIN_KEY_ENC_TAB = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5,
@@ -92,6 +93,7 @@ async def _get_wbi_keys(client: httpx.AsyncClient) -> tuple[str, str]:
     res = await client.get(
         "https://api.bilibili.com/x/web-interface/nav", headers=headers
     )
+    res.raise_for_status()
     json_data = res.json()
     wbi_img = json_data.get("data", {}).get("wbi_img", {})
     img_url = wbi_img.get("img_url", "")
@@ -179,6 +181,7 @@ async def search_videos(
         f"https://api.bilibili.com/x/web-interface/search/type?{qs}",
         headers=headers,
     )
+    res.raise_for_status()
     # Try multiple encodings to handle Bilibili API responses
     import json
     content = res.content
@@ -193,7 +196,9 @@ async def search_videos(
         # If all encodings fail, use UTF-8 with replacement characters
         json_data = json.loads(content.decode("utf-8", errors="replace"))
 
-    if json_data.get("code") != 0 or not json_data.get("data", {}).get("result"):
+    if json_data.get("code") != 0:
+        raise RuntimeError(f"B站搜索失败，code={json_data.get('code')}")
+    if not json_data.get("data", {}).get("result"):
         return {"total": 0, "videos": []}
 
     videos = []
@@ -217,3 +222,33 @@ async def search_videos(
 
     total = json_data["data"].get("numResults", len(videos))
     return {"total": total, "videos": videos}
+
+
+async def search_with_network_policy(keyword: str, page: int = 1) -> dict[str, Any]:
+    """Try each distinct egress once; never hide a rejected search as no results."""
+    attempts: list[str] = []
+    detail = "B站搜索失败"
+    for route, proxy in network_routes():
+        attempts.append(route)
+        try:
+            async with httpx.AsyncClient(timeout=20, trust_env=False, proxy=proxy or None) as client:
+                result = await search_videos(client, keyword) if page == 1 else await search_videos(client, keyword, page)
+            return {"status": "ok", **result, "videos": [
+                item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                for item in result.get("videos", [])
+            ], "network_route": route, "network_attempts": attempts}
+        except Exception as exc:
+            detail = redact_proxy(str(exc))
+            transient = isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+            if transient and len(attempts) == len(network_routes()):
+                return {"status": "error", "error_code": "bilibili_transient_error", "error": detail,
+                        "retryable": True, "attempts": len(attempts), "network_attempts": attempts,
+                        "total": 0, "videos": []}
+    return {"status": "error", "error_code": "bilibili_search_failed", "error": detail,
+            "retryable": False, "attempts": len(attempts), "network_attempts": attempts,
+            "total": 0, "videos": []}
+
+
+def search_cloud_candidates(keyword: str) -> dict[str, Any]:
+    import asyncio
+    return asyncio.run(search_with_network_policy(keyword))
