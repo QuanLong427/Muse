@@ -20,16 +20,18 @@ Musicer 是一个面向个人曲库的智能音乐播放器。Next.js 前端负�
 | --- | --- | --- |
 | 前端页面、播放器、聊天 UI | `frontend/app/page.tsx`、`frontend/app/context/` | `frontend/app/components/`、`frontend/app/hooks/`、`frontend/app/api/` |
 | 后端启动、路由和生命周期 | `backend/main.py` | `backend/routers/`、`backend/models.py` |
-| ReAct Agent、工具、上下文 | `backend/services/ai_agent.py` | `backend/services/llm_client.py`、`backend/routers/chat.py` |
-| 记忆与 Dream | `backend/services/memory_store.py`、`backend/services/memory_manager.py` | `backend/services/episode_memory.py`、`backend/services/dream_engine.py`、`docs/记忆系统说明.md` |
+| ReAct Agent、工具、上下文 | `backend/services/ai_agent.py`、`backend/services/agent_context.py` | `backend/services/llm_client.py`、`backend/routers/chat.py` |
+| 记忆与 Dream | `backend/services/memory_store.py`、`backend/services/memory_manager.py` | `backend/services/memory_profile_service.py`、`backend/services/episode_memory.py`、`backend/services/episode_evidence.py`、`backend/services/memory_task_service.py`、`backend/services/dream_engine.py`、`docs/记忆系统说明.md` |
 | LLM-Wiki | `skills/llm-wiki/SKILL.md` | `skills/llm-wiki/references/`、`skills/llm-wiki/scripts/`、`backend/services/wiki_*.py` |
 | 本地/B站搜索与下载 | `backend/services/music_manager.py`、`backend/services/bili_client.py` | `skills/local-search/`、`skills/cloud-search/`、`skills/convert/` |
 | 播放会话、状态与动作回执 | `frontend/app/context/PlayerContext.tsx`、`frontend/app/context/AgentContext.tsx` | `backend/services/playback_session_store.py`、`backend/services/player_action_store.py`、`backend/routers/playback.py` |
 | 本地曲库、最近播放、命名歌单 | `frontend/app/components/organisms/MusicWorkspace.tsx` | `frontend/app/context/PlaylistContext.tsx`、`backend/services/music_library_store.py`、`backend/routers/music_library.py` |
+| 智能歌单 | `frontend/app/components/organisms/SmartPlaylistPanel.tsx`、`frontend/app/components/molecules/PlaylistDraftCard.tsx` | `backend/services/playlist_draft_service.py`、`backend/services/smart_playlist_service.py`、`backend/services/recommendation_service.py` |
 | 对话推荐、Radio 与反馈 | `skills/music-recommendation/SKILL.md`、`backend/services/recommendation_service.py` | `backend/services/preference_service.py`、`backend/services/music_library_store.py`、`frontend/app/context/PlayerContext.tsx` |
 | 场景共享状态 | `frontend/app/context/ScenarioContext.tsx` | `frontend/app/context/AgentContext.tsx`、`frontend/app/context/PlayerContext.tsx` |
 | 语音 | `frontend/app/hooks/useVoiceRecorder.ts` | `backend/routers/voice.py`、`backend/services/voice_service.py` |
 | Docker 安装与运行 | `install.md`、`docker-compose.yml` | `backend/Dockerfile`、`frontend/Dockerfile` |
+| SQLite 连接与离线迁移 | `backend/services/sqlite_runtime.py` | `backend/scripts/migrate_sqlite_journal.py`、`install.md` |
 | 测试 | `backend/tests/` | 与被修改服务同名的 `test_*.py` |
 
 ## 文档索引
@@ -38,7 +40,7 @@ Musicer 是一个面向个人曲库的智能音乐播放器。Next.js 前端负�
 - [install.md](install.md)：唯一正式安装路径，使用 Docker Compose。
 - [docs/项目架构说明.md](docs/项目架构说明.md)：当前运行架构、模块职责、数据流、已知缺口和目标演进。
 - [docs/需求文档.md](docs/需求文档.md)：产品目标、功能需求、优先级和验收标准。
-- [docs/记忆系统说明.md](docs/记忆系统说明.md)：当前记忆 v2.2 的数据层、长期记忆/episode 召回、场景投影、触发策略和边界。
+- [docs/记忆系统说明.md](docs/记忆系统说明.md)：当前记忆 v2.3 的数据层、长期记忆/episode 召回、任务关联、场景投影、触发策略和边界。
 - [docs/references/README.md](docs/references/README.md)：外部 API 参考资料索引，只作为实现依据，不作为项目现状说明。
 - `skills/*/SKILL.md`：运行时 Agent Skill 的真实说明；修改 Skill 行为时以这些文件为入口。
 

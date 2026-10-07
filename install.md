@@ -90,6 +90,28 @@ Compose 将下列宿主机目录挂载到容器：
 
 `docker compose down` 不会删除这些目录。重建镜像也不会删除用户数据。不要使用 `down -v` 作为重置 Wiki 或记忆的方式；使用应用提供的显式重置入口。
 
+### SQLite 日志兼容与迁移
+
+默认 `SQLITE_JOURNAL_MODE=DELETE` 保留事务保护，不依赖 WAL 共享内存。Windows Docker 共享挂载建议保持此默认值；仅在兼容的本机文件系统上显式设置 `WAL`。后端健康检查同时验证记忆表可读。
+
+如果旧数据库处于 WAL 模式，并出现容器 `disk I/O error`、宿主机仍可读取，先停止后端及所有数据库查看器，再从宿主机执行离线迁移。脚本先用 SQLite backup API 备份全部目标并验证完整性，再 checkpoint、切换日志模式及核对表记录数。不要手动删除 `-wal`、`-shm` 或原数据库。
+
+```powershell
+docker compose stop backend
+python backend/scripts/migrate_sqlite_journal.py --offline --database memory/data/memory.db --database memory/data/download-jobs.db --database db/wiki-sync.db --backup-dir memory/data/sqlite-backups/your-unique-backup-name
+docker compose up -d --build
+```
+
+只列出实际存在的数据库；备份目录必须不存在，重复执行应换新名称。日志模式切换不重置歌曲、歌单或长期记忆。SQLite WAL 的共享内存要求见 [官方说明](https://www.sqlite.org/wal.html)。
+
+迁移时出现 `database is locked` 或 Windows 文件占用，应关闭 SQLiteStudio 等数据库查看器，不能强制删除 sidecar 或自动结束用户进程。Windows 可用只读脚本查询占用者：
+
+```powershell
+backend/scripts/find_sqlite_lock_owners.ps1 -DatabasePaths "$PWD/memory/data/memory.db"
+```
+
+仅在无法原位切换且已确认所有应用停止时，可使用迁移脚本的 `--restore-snapshot <已验证备份>` 与 `--archive-dir <新归档目录>` 显式恢复单个数据库；恢复前校验完整性、表记录数和逻辑内容摘要，原库及 sidecar 一起归档，不删除原数据。
+
 ## 5. 常用运维命令
 
 ```bash
@@ -119,9 +141,17 @@ docker compose exec backend python /app/skills/llm-wiki/scripts/wiki_ops.py audi
 
 ## 6. 故障排查
 
+### B站下载与 VPN 共存
+
+在 `backend/.env.local` 设置 `BILIBILI_NETWORK_MODE=auto`（默认）。下载和搜索先显式直连，失败后尝试 `BILIBILI_PROXY_URL`；不受模型 API 使用的代理设置影响。`direct` 只直连，`proxy` 只使用代理。没有专用代理时，`auto` 可以使用环境中的 HTTP(S) 代理作为备用。
+
+Docker Desktop 访问宿主机代理的示例：`BILIBILI_PROXY_URL=http://host.docker.internal:7890`。端口按代理客户端实际 HTTP/混合端口填写，客户端需要允许局域网访问；不要使用容器内的 `127.0.0.1`。修改后执行 `docker compose up -d --force-recreate backend`。
+
+显式直连可以绕过应用层 HTTP 代理，但不能绕过 VPN 的全局/TUN 路由。保留 VPN 开启时，在代理客户端为 `bilibili.com`、`bilivideo.com`、`hdslb.com` 及其子域名设置 DIRECT。若希望经过 VPN 下载，使用 `proxy` 和能够访问 B站的出口；B站仍可能限制部分出口 IP 或要求有效 Cookie，软件无法保证所有节点可用。Cookie 配置见前文。
+
 - Agent 提示环境变量缺失：确认已经创建 `.env` 和 `backend/.env.local`，并重新创建后端容器。
 - 前端能打开但没有歌曲：确认 `MUSIC_PATH` 是宿主机真实目录，并允许 Docker Desktop 访问该磁盘。
 - Agent 提示 API 未配置：检查 `OPENAI_API_KEY` 与 `OPENAI_BASE_URL`，然后执行 `docker compose up -d --force-recreate backend`。
-- B 站返回 `412 request was banned`：这通常是当前出口 IP、请求频率或登录状态触发风控，不等于视频设置了访问限制。若正在使用 VPN，先关闭 VPN，或让 `*.bilibili.com`、`*.bilivideo.com`、`*.hdslb.com` 走直连；必要时再配置上述 Cookie。不要连续重试。
+- B 站返回 `412 request was banned`：这是出口 IP、请求频率或登录状态触发风控的线索，不等于视频设置了访问限制。检查返回的 `network_attempts`、VPN 分流和 Cookie；不要连续重试同一出口。
 - B 站转换的其他错误：查看 `docker compose logs backend`；镜像已包含 yt-dlp、浏览器模拟依赖和 ffmpeg，不需要在宿主机单独安装。
 - 修改前端后看不到变化：执行 `docker compose up -d --build frontend`。
