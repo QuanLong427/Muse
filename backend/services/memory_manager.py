@@ -1,4 +1,4 @@
-"""Compatibility facade for the v2.2 memory system.
+"""Compatibility facade for the v2.3 memory system.
 
 SQLite is the source of truth for conversations and structured memories. The
 Markdown profile remains an inspectable compatibility projection so existing
@@ -296,7 +296,10 @@ def get_structured_memory_context(
         key=lambda pair: (pair[0], str(pair[1].get("updated_at") or "")),
         reverse=True,
     )
-    selected = [item for _, item in ranked[: max(1, min(int(limit), 10))]]
+    mandatory_items = [item for _, item in ranked if item.get("kind") in mandatory_kinds
+                       and float(item.get("confidence") or 0) >= 0.85]
+    optional_items = [item for _, item in ranked if item not in mandatory_items]
+    selected = mandatory_items + optional_items[:max(0, min(int(limit), 10) - len(mandatory_items))]
     if not selected:
         return ""
     return "\n".join(
@@ -322,7 +325,7 @@ def get_relevant_episode_context(
     query: str,
     limit: int = 3,
 ) -> dict[str, Any]:
-    """Retrieve every turn, but inject only when episodic context can help.
+    """Evaluate every turn; query storage only when episodic context can help.
 
     Simple transport controls such as "下一首" do not benefit from a prior
     episode.  Personalized, multi-step, corrective and explicit-history
@@ -340,6 +343,7 @@ def get_relevant_episode_context(
         scenario=scenario or "默认",
         limit=limit,
         min_score=0.18 if explicit_recall else 0.22,
+        include_failed=bool(re.search(r"失败|出错|错误|重试|超时|412", query)),
     )
     threshold = 0.2 if explicit_recall else 0.3
     selected = [
@@ -353,6 +357,7 @@ def get_relevant_episode_context(
     lines = [
         "## 与当前请求相关的过往事件",
         "以下是可追溯的历史执行记录，仅供参考；如与本轮要求冲突，以本轮为准。",
+        "失败经历仅作风险与恢复参考；旧事件没有结构化回执时，历史回复不证明实际执行成功。",
     ]
     for episode in selected:
         created = str(episode.get("created_at", ""))[:10]
@@ -361,6 +366,9 @@ def get_relevant_episode_context(
             f"动作：{episode['action_summary'][:300]}",
             f"结果：{episode['result_status']}，{episode['result_summary'][:500]}",
         ]
+        receipts = episode.get("context", {}).get("receipts")
+        if receipts:
+            parts.append("可观察回执：" + json.dumps(receipts[:5], ensure_ascii=False))
         constraints = episode.get("constraints") or []
         if constraints:
             parts.append("约束：" + "；".join(map(str, constraints[:5])))

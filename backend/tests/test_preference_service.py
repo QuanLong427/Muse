@@ -153,3 +153,17 @@ def test_profile_can_be_scoped_to_current_scenario(monkeypatch):
 
     assert profile["scenario"] == "开车"
     assert [item["track_id"] for item in tracks] == ["drive-track"]
+
+
+def test_unknown_artists_keep_track_evidence_without_artist_preference(monkeypatch):
+    now = datetime(2026, 10, 4, tzinfo=timezone.utc)
+    authors = ["Unknown", "UNKNOWN ARTIST", "未知歌手", "N/A", "周杰伦"]
+    catalog = [_track(str(i), author) for i, author in enumerate(authors)]
+    monkeypatch.setattr(service, "list_playback_events_since", lambda **kwargs: [
+        {"track_id": t.id, "title": t.title, "author": t.author, "event_type": "play_completed", "scenario": "跑步", "occurred_at": now.isoformat()} for t in catalog])
+    monkeypatch.setattr(service, "list_track_feedback_events_since", lambda **kwargs: [])
+    monkeypatch.setattr(service, "scan_tracks", lambda: catalog)
+    window = service.get_preference_window(service.build_recent_preference_profile(now=now, scenario="跑步"), 7)
+    assert len(window["tracks"]) == 5
+    assert [item["author"] for item in window["artists"]] == ["周杰伦"]
+    assert all(item["author"] == "" for item in window["tracks"] if item["track_id"] != "4")

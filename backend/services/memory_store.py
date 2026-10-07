@@ -145,6 +145,28 @@ def init_memory_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_memory_episodes_context
                     ON memory_episodes(user_id, scenario, episode_type, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS memory_tasks (
+                    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, anchor_id TEXT NOT NULL, goal TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    UNIQUE(user_id, session_id, kind, anchor_id),
+                    FOREIGN KEY(user_id) REFERENCES memory_users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(session_id) REFERENCES memory_sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS memory_task_entities (
+                    task_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+                    PRIMARY KEY(task_id, entity_type, entity_id),
+                    FOREIGN KEY(task_id) REFERENCES memory_tasks(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_task_entities_lookup
+                    ON memory_task_entities(entity_type, entity_id);
+                CREATE TABLE IF NOT EXISTS memory_task_episodes (
+                    task_id TEXT NOT NULL, episode_id TEXT NOT NULL,
+                    PRIMARY KEY(task_id, episode_id),
+                    FOREIGN KEY(task_id) REFERENCES memory_tasks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(episode_id) REFERENCES memory_episodes(id) ON DELETE CASCADE
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
@@ -612,6 +634,8 @@ def search_memory_episodes(
     scenario: str | None = None,
     limit: int = 3,
     min_score: float = 0.22,
+    include_failed: bool = False,
+    allow_cross_scenario: bool = False,
 ) -> list[dict[str, Any]]:
     """Rank episodes using lexical relevance, context, recency and salience.
 
@@ -629,14 +653,15 @@ def search_memory_episodes(
     )
     conn = _connect()
     try:
-        rows = conn.execute(
-            """
-            SELECT * FROM memory_episodes
-            WHERE user_id = ? AND result_status IN ('success', 'partial')
-            ORDER BY created_at DESC LIMIT 300
-            """,
-            (user_id,),
-        ).fetchall()
+        sql = "SELECT * FROM memory_episodes WHERE user_id = ?"
+        params: list[Any] = [user_id]
+        if not include_failed:
+            sql += " AND result_status IN ('success', 'partial')"
+        if scenario and not allow_cross_scenario:
+            sql += " AND scenario = ?"
+            params.append(scenario)
+        sql += " ORDER BY created_at DESC LIMIT 300"
+        rows = conn.execute(sql, params).fetchall()
         ranked: list[tuple[float, dict[str, Any]]] = []
         normalized_query = re.sub(r"\s+", "", query.lower())
         for row in rows:

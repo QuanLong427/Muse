@@ -1,11 +1,23 @@
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from services import memory_manager, memory_store
 from services.episode_memory import archive_turn_episode
 from services.memory_manager import get_relevant_episode_context
+
+
+def test_interrupted_playlist_with_committed_writes_is_partial(monkeypatch, tmp_path):
+    _isolated_store(monkeypatch, tmp_path)
+    session_id = memory_store.ensure_session("s", "u", "默认")
+    episode = archive_turn_episode(user_id="u", session_id=session_id, scenario="默认", user_message="加入10首歌",
+        source_message_ids=[], tool_events=[{"phase": "result", "name": "add_track_to_music_playlist",
+            "content": json.dumps({"status": "added", "playlist": {"id": "p", "items": [{}]}})}],
+        final_text="已加入1首，剩余未完成", error="execution_budget_exhausted")
+    assert episode["result_status"] == "partial"
+    assert episode["result_summary"] == "已加入1首，剩余未完成"
 
 
 def _isolated_store(monkeypatch, tmp_path):

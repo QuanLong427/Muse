@@ -127,3 +127,16 @@ def test_structured_context_selects_relevant_and_mandatory_memories(monkeypatch,
     assert "不要推荐低质量翻唱" in context
     assert "跑步时优先推荐摇滚" in context
     assert "睡觉时优先推荐钢琴曲" not in context
+
+
+def test_trusted_scene_preference_generates_only_its_own_projection(monkeypatch, tmp_path):
+    data_dir = _isolate_memory(monkeypatch, tmp_path)
+    session = memory_store.ensure_session("s", "local", "跑步")
+    source_id = memory_store.add_message(session_id=session, user_id="local", role="user", content="记住：跑步时优先摇滚", scenario="跑步")
+    result = memory_store.stage_candidate(user_id="local", kind="preference", scenario="跑步", memory_key="genre:摇滚", directive="跑步时优先摇滚", confidence=1.0, evidence_type="explicit_preference", source_message_ids=[source_id])
+    assert result["status"] == "promoted"
+    memory_manager.sync_profile_projection("local")
+    assert "跑步时优先摇滚" in memory_manager.read_scenario_profile("跑步", "local")
+    assert "跑步时优先摇滚" not in memory_manager.read_profile("local")
+    assert memory_manager.read_scenario_profile("睡觉", "local") == ""
+    assert len(list((data_dir / "scenarios").glob("*.md"))) == 1

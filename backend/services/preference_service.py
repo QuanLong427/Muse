@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from models import Track
+from services.music_metadata import normalize_artist
 from services.music_library_store import (
     DEFAULT_USER_ID,
     list_playback_events_since,
@@ -70,7 +71,7 @@ def _empty_signal(track_id: str, metadata: dict[str, str]) -> dict[str, Any]:
     return {
         "track_id": track_id,
         "title": metadata.get("title", ""),
-        "author": metadata.get("author", ""),
+        "author": normalize_artist(metadata.get("author", "")),
         "score": 0.0,
         "evidence_count": 0,
         "positive_count": 0,
@@ -108,7 +109,7 @@ def _window_projection(
         if not signal["title"]:
             signal["title"] = metadata.get("title", "")
         if not signal["author"]:
-            signal["author"] = metadata.get("author", "")
+            signal["author"] = normalize_artist(metadata.get("author", ""))
         signal["score"] += decayed
         signal["evidence_count"] += 1
         signal["positive_count" if weight > 0 else "negative_count"] += 1
@@ -155,7 +156,7 @@ def _window_projection(
     artist_values: dict[str, dict[str, Any]] = {}
     for signal in tracks.values():
         signal["score"] = round(float(signal["score"]), 6)
-        author = str(signal.get("author") or "").strip()
+        author = normalize_artist(signal.get("author"))
         if not author:
             continue
         artist = artist_values.setdefault(
