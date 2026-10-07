@@ -91,3 +91,16 @@ async def retry_failed_download_job(job_id: str, req: DownloadJobActionRequest):
     if job is None:
         raise HTTPException(status_code=404, detail="download job not found")
     return {"status": "queued", "job": job}
+
+
+@router.post("/{job_id}/wiki-retry")
+async def retry_knowledge_build(job_id: str, req: DownloadJobActionRequest):
+    job = get_download_job(job_id, user_id=req.user_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="download job not found")
+    from services.wiki_sync import retry_wiki_enrichment
+    restarted = []
+    for source in job.get("result", {}).get("wiki_sync", {}).get("jobs", []):
+        if source.get("enrichment_status") in {"failed", "needs_review"}:
+            restarted.append(retry_wiki_enrichment(source["id"]))
+    return {"jobs": restarted}

@@ -120,6 +120,16 @@ def _job_from_conn(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | No
         "SELECT * FROM download_job_items WHERE job_id = ? ORDER BY position",
         (job_id,),
     ).fetchall()
+    result = _json_object(row["result_json"])
+    wiki_sync = result.get("wiki_sync")
+    if isinstance(wiki_sync, dict):
+        from services.wiki_sync import get_wiki_sync_job
+        for item in wiki_sync.get("jobs", []):
+            if isinstance(item, dict) and item.get("id"):
+                try:
+                    item.update(get_wiki_sync_job(item["id"]))
+                except LookupError:
+                    pass
     return {
         "id": row["id"],
         "user_id": row["user_id"],
@@ -129,7 +139,7 @@ def _job_from_conn(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | No
         "failed_items": row["failed_items"],
         "progress": round(float(row["progress"]), 2),
         "cancel_requested": bool(row["cancel_requested"]),
-        "result": _json_object(row["result_json"]),
+        "result": result,
         "last_error": row["last_error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],

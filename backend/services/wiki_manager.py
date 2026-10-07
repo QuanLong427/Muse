@@ -15,7 +15,7 @@ WIKI_TEMPLATE_DIR = PROJECT_ROOT / "template" / "wiki"
 CURRENT_WIKI_SCHEMA_VERSION = "3.0"
 ENTITY_TYPES = ("songs", "artists", "genres", "albums")
 WIKI_RESET_MANIFEST_DIR = PROJECT_ROOT / "db" / "wiki-reset-manifests"
-_WIKI_RESET_LOCK = threading.Lock()
+_WIKI_RESET_LOCK = threading.RLock()
 
 
 def _ensure_dirs(wiki_dir: str) -> None:
@@ -181,6 +181,8 @@ def reset_wiki(
         raise ValueError("恢复清单目录不能位于将被重置的 Wiki 目录内")
 
     with _WIKI_RESET_LOCK:
+        from services.wiki_sync import cancel_wiki_enrichment
+        cancel_wiki_enrichment(str(wiki_path))
         manifest = build_wiki_recovery_manifest(str(wiki_path), str(music_path))
         manifest_root.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")

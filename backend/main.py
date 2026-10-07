@@ -21,6 +21,18 @@ logger = logging.getLogger(__name__)
 # ── Dream Background Scheduler ───────────────────────────────────────────────
 
 _dream_task = None
+_wiki_task = None
+
+
+async def _wiki_scheduler():
+    from services.wiki_sync import process_next_wiki_enrichment
+    while True:
+        try:
+            result = await asyncio.to_thread(process_next_wiki_enrichment)
+        except Exception:
+            logger.exception("[wiki-scheduler] Knowledge build failed")
+            result = None
+        await asyncio.sleep(1 if result else 15)
 
 async def _dream_scheduler():
     """Background task: trigger Dream engine every DREAM_INTERVAL_HOURS."""
@@ -43,7 +55,7 @@ async def _dream_scheduler():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    global _dream_task
+    global _dream_task, _wiki_task
 
     # Startup: init system files
     try:
@@ -68,12 +80,21 @@ async def lifespan(app: FastAPI):
         logger.error(f"[startup] Runtime store initialization failed: {e}")
 
     # Startup: start dream scheduler
+    from services.wiki_sync import recover_wiki_enrichment
+    recover_wiki_enrichment()
+    _wiki_task = asyncio.create_task(_wiki_scheduler())
     _dream_task = asyncio.create_task(_dream_scheduler())
     logger.info(f"[startup] Dream scheduler started (interval: {getattr(settings, 'DREAM_INTERVAL_HOURS', 24)}h)")
 
     yield
 
     # Shutdown
+    if _wiki_task:
+        _wiki_task.cancel()
+        try:
+            await _wiki_task
+        except asyncio.CancelledError:
+            pass
     if _dream_task:
         _dream_task.cancel()
         try:

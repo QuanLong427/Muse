@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+from functools import wraps
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from typing import Dict, List, Optional
@@ -218,12 +219,21 @@ external_source_count: {len(external_sources)}
     return filepath
 
 
+def _serialized_write(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        from services.wiki_manager import _WIKI_RESET_LOCK
+        with _WIKI_RESET_LOCK:
+            return function(*args, **kwargs)
+    return guarded
+
+
+@_serialized_write
 def register_source_asset(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
     """Register verified source identity without running LLM enrichment.
 
-    This is used by the download lifecycle.  It intentionally writes only a
-    raw source asset; graph entities remain pending until the explicit
-    llm-wiki ingest workflow runs.
+    Used by the download lifecycle before the independently tracked background
+    ingest runs. Registration itself never promotes semantic facts.
     """
     from services.wiki_manager import get_wiki_status, init_wiki
 
@@ -267,7 +277,7 @@ def _check_cache(raw_path: str, wiki_dir: str) -> bool:
 
     if rel_path in cache.get("entries", {}):
         entry = cache["entries"][rel_path]
-        if entry.get("fingerprint") == fingerprint:
+        if entry.get("fingerprint") == fingerprint and Path(wiki_dir, entry.get("song_entity") or "").is_file():
             return True  # HIT - same content
 
     return False  # MISS
@@ -312,7 +322,7 @@ def _update_cache(raw_path: str, song_entity_path: str, wiki_dir: str) -> None:
 def _call_llm(prompt: str) -> str:
     """Call Qwen with non-thinking JSON mode for reliable extraction."""
     try:
-        client = create_openai_client()
+        client = create_openai_client().with_options(timeout=60, max_retries=0)
         response = client.chat.completions.create(
             model=settings.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
@@ -1020,6 +1030,7 @@ def _update_index_and_log(song_meta: Dict, song_entity_path: str, entity_pages: 
             f.write(log_content)
 
 
+@_serialized_write
 def ingest_song(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
     """
     Main ingest entry point. Processes a song through the pipeline.
@@ -1032,7 +1043,12 @@ def ingest_song(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
 
     # Step 2: Check cache
     if _check_cache(raw_path, wiki_dir):
-        return {"status": "cached", "title": song_meta.get("title", "")}
+        from services.wiki_manager import _read_frontmatter
+        cache = json.loads(Path(wiki_dir, ".wiki-cache.json").read_text(encoding="utf-8"))
+        entry = cache["entries"][os.path.relpath(raw_path, wiki_dir)]
+        metadata = _read_frontmatter(Path(wiki_dir, entry["song_entity"]).read_text(encoding="utf-8"))
+        return {"status": "cached", "title": song_meta.get("title", ""), "song_entity": entry["song_entity"],
+            "verification_status": metadata.get("verification_status", "needs_review"), "extraction_status": "completed"}
 
     # Step 3: Read raw material for LLM analysis
     with open(raw_path, "r", encoding="utf-8") as f:
@@ -1095,4 +1111,6 @@ def ingest_song(song_meta: Dict, wiki_dir: Optional[str] = None) -> Dict:
         "title": song_meta.get("title", ""),
         "song_entity": song_entity_path,
         "entities": len(all_entity_pages),
+        "verification_status": _verification_status(analysis.get("song", {}), analysis.get("uncertainties")),
+        "extraction_status": "completed" if llm_succeeded else "failed",
     }

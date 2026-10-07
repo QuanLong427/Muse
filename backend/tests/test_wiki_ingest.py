@@ -92,6 +92,9 @@ def test_raw_record_is_portable_and_source_aware(tmp_path):
 
 
 def test_cache_is_bound_to_pipeline_fingerprint(tmp_path):
+    entity = tmp_path / "wiki/entities/songs/Test.md"
+    entity.parent.mkdir(parents=True)
+    entity.write_text("---\nverification_status: inferred\n---\n", encoding="utf-8")
     cache_path = tmp_path / ".wiki-cache.json"
     cache_path.write_text(json.dumps({"version": 2, "entries": {}}), encoding="utf-8")
     raw_path = _save_raw_material({"bvid": "BV1cache", "title": "Test"}, str(tmp_path))
